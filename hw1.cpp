@@ -16,8 +16,6 @@ vector<pair<int,int>> id_to_rc(MAX_CELLS);
 int dr[4] = {-1,1,0,0}, dc[4] = {0,0,-1,1};
 char dir_char[4] = {'W','S','A','D'}; // up, down, left, right
 
-const int BEAM_WIDTH = 200000;
-
 // ---------- Utilities ----------
 inline string state_key(const State &s) {
     string k;
@@ -46,7 +44,6 @@ bool is_deadlock_simple(const State &s) {
     for (int i=0;i<N;++i){
         if (!s.boxes[i]) continue;
         if (targets[i]) continue;
-        if (fragile[i]) continue; // skip fragile boxes for deadlock
         auto [r,c] = id_to_rc[i];
         auto blocked = [&](int rr,int cc)->bool{
             if(rr<0||rr>=rows||cc<0||cc>=cols) return true;
@@ -179,7 +176,7 @@ string reconstruct_full_moves(const unordered_map<string,pair<string,char>> &par
 }
 
 // ---------- Beam A* solver ----------
-pair<int,string> astar_push_solver(const State &start){
+pair<int,string> astar_push_solver(const State &start, int beam_width){
     int N=rows*cols;
     manhattan_target_r.clear(); manhattan_target_c.clear();
     for(int i=0;i<N;++i) if(targets[i]){ manhattan_target_r.push_back(id_to_rc[i].first); manhattan_target_c.push_back(id_to_rc[i].second); }
@@ -221,8 +218,7 @@ pair<int,string> astar_push_solver(const State &start){
                     if(tr<0||tr>=rows||tc<0||tc>=cols) continue;
                     int pidx=pr*cols+pc, tidx=tr*cols+tc;
                     if(!reach[pidx]) continue;
-                    // only forbid moving box into fragile, walls, other boxes, or dead zone
-                    if(walls[tidx] || s.boxes[tidx] || dead_zone[tidx] || fragile[tidx]) continue;
+                    if(walls[tidx] || s.boxes[tidx] || fragile[tidx] || dead_zone[tidx]) continue;
                     State ns=s; ns.boxes[b]=0; ns.boxes[tidx]=1; ns.player=b;
                     if(is_deadlock(ns)) continue;
                     int h=heuristic_sum(ns), ng=g+1;
@@ -236,7 +232,7 @@ pair<int,string> astar_push_solver(const State &start){
             }
         }
         sort(next_level.begin(), next_level.end(), [](Node &a, Node &b){ return a.f < b.f; });
-        if((int)next_level.size()>BEAM_WIDTH) next_level.resize(BEAM_WIDTH);
+        if((int)next_level.size()>beam_width) next_level.resize(beam_width);
         for(auto &n : next_level) pq.push(n);
     }
     return {-1,""};
@@ -244,7 +240,7 @@ pair<int,string> astar_push_solver(const State &start){
 
 // ---------- Main ----------
 int main(int argc,char** argv){
-    ios::sync_with_stdio(false); cin.tie(nullptr);
+    // ios::sync_with_stdio(false); cin.tie(nullptr);
     if(argc<2){ cerr<<"Usage: "<<argv[0]<<" level.txt\n"; return 1; }
     ifstream fin(argv[1]); if(!fin){ cerr<<"Cannot open "<<argv[1]<<"\n"; return 1; }
     vector<string> lines; string line;
@@ -260,10 +256,10 @@ int main(int argc,char** argv){
             id_to_rc[idx]={r,c};
             char ch=lines[r][c];
             walls[idx]=(ch=='#');
-            fragile[idx]=(ch=='!'||ch=='@');  // only empty fragile tiles
+            fragile[idx]=(ch=='@'||ch=='!');
             targets[idx]=(ch=='.'||ch=='O'||ch=='X');
             start.boxes[idx]=(ch=='x'||ch=='X');
-            if(ch=='o'||ch=='O'||ch=='@'||ch=='!') start.player=idx; // player can start on fragile tile
+            if(ch=='o'||ch=='O'||ch=='!') start.player=idx;
         }
     }
 
@@ -276,8 +272,18 @@ int main(int argc,char** argv){
         if((up||down)&&(left||right)) dead_zone[i]=true;
     }
 
-    auto res=astar_push_solver(start);
-    if(res.first>=0) cout<<res.second<<"\n";
-    else cout<<"No solution found by Beam-A*\n";
+    // Try increasing beam widths
+    vector<int> beam_widths = {500, 5000, 30000, 60000, 100000, 200000};
+    // vector<int> beam_widths = {20000, 50000, 80000, 100000};
+    for(int bw : beam_widths){
+        auto res=astar_push_solver(start, bw);
+        if(res.first>=0){
+            cout<<res.second<<"\n";
+            // cout<<"Solution found with beam width="<<bw<<"\n";
+            return 0;
+        }
+        // cout<<"Failed with beam width="<<bw<<"\n";
+    }
+    cout<<"No solution found by Beam-A*\n";
     return 0;
 }
