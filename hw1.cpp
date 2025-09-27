@@ -10,11 +10,13 @@ struct State {
     bitset<MAX_CELLS> boxes;
 };
 
-int rows = 0, cols = 0;
-vector<bool> walls(MAX_CELLS,false), targets(MAX_CELLS,false), fragile(MAX_CELLS,false);
+int rows=0, cols=0;
+vector<bool> walls(MAX_CELLS,false), targets(MAX_CELLS,false), fragile(MAX_CELLS,false), dead_zone(MAX_CELLS,false);
 vector<pair<int,int>> id_to_rc(MAX_CELLS);
 int dr[4] = {-1,1,0,0}, dc[4] = {0,0,-1,1};
 char dir_char[4] = {'W','S','A','D'}; // up, down, left, right
+
+const int BEAM_WIDTH = 200000;
 
 // ---------- Utilities ----------
 inline string state_key(const State &s) {
@@ -25,6 +27,7 @@ inline string state_key(const State &s) {
     k += to_string(s.player);
     return k;
 }
+
 State parse_state_key(const string &k) {
     State s;
     int sep = k.find('|');
@@ -35,307 +38,246 @@ State parse_state_key(const string &k) {
     return s;
 }
 
-// helper: whether a cell index is valid
-inline bool in_bounds_idx(int idx) {
-    return idx >= 0 && idx < rows*cols;
-}
+inline bool in_bounds_idx(int idx) { return idx >=0 && idx < rows*cols; }
 
-// ---------- Deadlock: simple corner (treat fragile as blocking for boxes) ----------
+// ---------- Deadlock detection ----------
 bool is_deadlock_simple(const State &s) {
-    int N = rows * cols;
-    for (int i = 0; i < N; ++i) {
+    int N = rows*cols;
+    for (int i=0;i<N;++i){
         if (!s.boxes[i]) continue;
         if (targets[i]) continue;
+        if (fragile[i]) continue; // skip fragile boxes for deadlock
         auto [r,c] = id_to_rc[i];
-        // For boxes, a neighbor is blocking if it's a wall or a fragile tile (boxes can't occupy fragile)
-        auto blocked = [&](int rr, int cc)->bool{
-            if (rr < 0 || rr >= rows || cc < 0 || cc >= cols) return true;
-            int idx = rr*cols + cc;
-            return walls[idx] || fragile[idx];
+        auto blocked = [&](int rr,int cc)->bool{
+            if(rr<0||rr>=rows||cc<0||cc>=cols) return true;
+            int idx = rr*cols+cc;
+            return walls[idx];
         };
-        bool up = blocked(r-1,c);
-        bool down = blocked(r+1,c);
-        bool left = blocked(r,c-1);
-        bool right = blocked(r,c+1);
-        if ((up || down) && (left || right)) return true;
+        bool up=blocked(r-1,c), down=blocked(r+1,c), left=blocked(r,c-1), right=blocked(r,c+1);
+        if ((up||down)&&(left||right)) return true;
     }
     return false;
 }
 
-// ---------- Player reachability (BFS) ----------
-// Player can step on fragile tiles; boxes block movement.
+bool is_deadlock(const State &s) {
+    if(is_deadlock_simple(s)) return true;
+    int N = rows*cols;
+    for(int i=0;i<N;++i){
+        if(!s.boxes[i]) continue;
+        if(dead_zone[i]) return true;
+    }
+    return false;
+}
+
+// ---------- Player reachability ----------
 bitset<MAX_CELLS> player_reachable(int start, const bitset<MAX_CELLS> &boxes) {
     bitset<MAX_CELLS> seen;
     queue<int> q;
-    seen[start] = 1;
-    q.push(start);
+    seen[start]=1; q.push(start);
     while(!q.empty()){
         int u = q.front(); q.pop();
         auto [r,c] = id_to_rc[u];
-        for (int d=0; d<4; ++d) {
+        for(int d=0;d<4;++d){
             int nr=r+dr[d], nc=c+dc[d];
-            if (nr<0||nr>=rows||nc<0||nc>=cols) continue;
-            int v = nr*cols + nc;
-            if (walls[v]) continue;      // walls block
-            if (boxes[v]) continue;      // boxes block player walking
-            if (!seen[v]) { seen[v]=1; q.push(v); }
+            if(nr<0||nr>=rows||nc<0||nc>=cols) continue;
+            int v = nr*cols+nc;
+            if(walls[v] || boxes[v]) continue;
+            if(!seen[v]) { seen[v]=1; q.push(v); }
         }
     }
     return seen;
 }
 
-// ---------- BFS path (player-only) returning move letters ----------
-string bfs_player_path(const State &s, int from_idx, int to_idx) {
-    if (from_idx == to_idx) return string();
+// ---------- BFS player path ----------
+string bfs_player_path(const State &s,int from_idx,int to_idx){
+    if(from_idx==to_idx) return string();
     int N = rows*cols;
-    vector<int> prev(N, -1), prev_dir(N, -1);
-    queue<int> q;
-    vector<char> seen(N,0);
+    vector<int> prev(N,-1), prev_dir(N,-1);
+    queue<int> q; vector<char> seen(N,0);
     q.push(from_idx); seen[from_idx]=1;
     bool found=false;
     while(!q.empty() && !found){
-        int u = q.front(); q.pop();
+        int u=q.front(); q.pop();
         auto [r,c] = id_to_rc[u];
-        for (int d=0; d<4; ++d) {
+        for(int d=0;d<4;++d){
             int nr=r+dr[d], nc=c+dc[d];
-            if (nr<0||nr>=rows||nc<0||nc>=cols) continue;
-            int v = nr*cols + nc;
-            if (walls[v] || s.boxes[v]) continue;
-            if (seen[v]) continue;
+            if(nr<0||nr>=rows||nc<0||nc>=cols) continue;
+            int v=nr*cols+nc;
+            if(walls[v] || s.boxes[v]) continue;
+            if(seen[v]) continue;
             seen[v]=1; prev[v]=u; prev_dir[v]=d;
-            if (v == to_idx) { found=true; break; }
+            if(v==to_idx){ found=true; break; }
             q.push(v);
         }
     }
-    if (!found) return string(); // shouldn't happen if reachability checked
+    if(!found) return string();
     vector<char> steps;
-    int cur = to_idx;
-    while (cur != from_idx) {
-        int d = prev_dir[cur];
-        steps.push_back(dir_char[d]);
-        cur = prev[cur];
+    int cur=to_idx;
+    while(cur!=from_idx){
+        steps.push_back(dir_char[prev_dir[cur]]);
+        cur=prev[cur];
     }
     reverse(steps.begin(), steps.end());
     return string(steps.begin(), steps.end());
 }
 
-// ---------- Precompute distances to nearest target for boxes ----------
-// Boxes cannot be on fragile tiles, so do BFS on cells that are not walls and not fragile.
-vector<int> dist_to_target;
-void compute_dist_to_targets() {
-    int N = rows*cols;
-    dist_to_target.assign(N, INT_MAX);
-    queue<int> q;
-    for (int i=0;i<N;++i) {
-        if (targets[i] && !fragile[i] && !walls[i]) { // target must be box-walkable
-            dist_to_target[i] = 0;
-            q.push(i);
+// ---------- Heuristic ----------
+vector<int> manhattan_target_r, manhattan_target_c;
+int heuristic_sum(const State &s){
+    int h=0;
+    int N=rows*cols;
+    vector<pair<int,int>> box_positions;
+    for(int i=0;i<N;++i) if(s.boxes[i]) box_positions.push_back(id_to_rc[i]);
+    for(auto [br,bc]: box_positions){
+        int best=INT_MAX;
+        for(size_t t=0;t<manhattan_target_r.size();++t){
+            int d=abs(br-manhattan_target_r[t])+abs(bc-manhattan_target_c[t]);
+            best=min(best,d);
         }
-    }
-    while(!q.empty()){
-        int u = q.front(); q.pop();
-        auto [r,c] = id_to_rc[u];
-        for (int d=0; d<4; ++d) {
-            int nr=r+dr[d], nc=c+dc[d];
-            if (nr<0||nr>=rows||nc<0||nc>=cols) continue;
-            int v = nr*cols + nc;
-            if (walls[v] || fragile[v]) continue; // boxes can't pass here
-            if (dist_to_target[v] > dist_to_target[u] + 1) {
-                dist_to_target[v] = dist_to_target[u] + 1;
-                q.push(v);
-            }
-        }
-    }
-}
-
-// ---------- Heuristic: sum of distances for boxes to nearest target ----------
-int heuristic_sum(const State &s) {
-    int h = 0;
-    int N = rows*cols;
-    for (int i=0;i<N;++i) if (s.boxes[i]) {
-        // if box is on fragile (shouldn't happen for valid input) treat as dead
-        if (fragile[i]) return INT_MAX/4;
-        int d = dist_to_target[i];
-        if (d==INT_MAX) return INT_MAX/4;
-        h += d;
+        h+=best;
     }
     return h;
 }
 
-// ---------- Reconstruct full move string (walks + push) ----------
-string reconstruct_full_moves(const unordered_map<string, pair<string,char>> &parent, const string &goal_key) {
-    vector<string> keys;
-    string cur = goal_key;
-    while (true) {
+// ---------- Reconstruct moves ----------
+string reconstruct_full_moves(const unordered_map<string,pair<string,char>> &parent,const string &goal_key){
+    vector<string> keys; string cur=goal_key;
+    while(true){
         keys.push_back(cur);
-        auto it = parent.find(cur);
-        if (it == parent.end()) break;
-        const string &pk = it->second.first;
-        if (pk.empty()) break;
-        cur = pk;
+        auto it=parent.find(cur);
+        if(it==parent.end()) break;
+        const string &pk=it->second.first;
+        if(pk.empty()) break;
+        cur=pk;
     }
-    reverse(keys.begin(), keys.end()); // start -> ... -> goal
-
+    reverse(keys.begin(), keys.end());
     string result;
-    for (size_t i = 0; i + 1 < keys.size(); ++i) {
-        State ps = parse_state_key(keys[i]);
-        State cs = parse_state_key(keys[i+1]);
-        int b = -1, t = -1;
-        int N = rows*cols;
-        for (int idx=0; idx<N; ++idx) {
-            if (ps.boxes[idx] && !cs.boxes[idx]) { b = idx; break; }
+    for(size_t i=0;i+1<keys.size();++i){
+        State ps=parse_state_key(keys[i]);
+        State cs=parse_state_key(keys[i+1]);
+        int b=-1, t=-1; int N=rows*cols;
+        for(int idx=0;idx<N;++idx){
+            if(ps.boxes[idx] && !cs.boxes[idx]){ b=idx; break; }
         }
-        for (int idx=0; idx<N; ++idx) {
-            if (!ps.boxes[idx] && cs.boxes[idx]) { t = idx; break; }
+        for(int idx=0;idx<N;++idx){
+            if(!ps.boxes[idx] && cs.boxes[idx]){ t=idx; break; }
         }
-        if (b == -1 || t == -1) {
-            char mv = parent.at(keys[i+1]).second;
-            if (mv) result.push_back(mv);
+        if(b==-1 || t==-1){
+            char mv=parent.at(keys[i+1]).second;
+            if(mv) result.push_back(mv);
             continue;
         }
-        auto [br, bc] = id_to_rc[b];
-        auto [tr, tc] = id_to_rc[t];
-        int d = -1;
-        for (int dd=0; dd<4; ++dd) if (br + dr[dd] == tr && bc + dc[dd] == tc) { d = dd; break; }
-        if (d == -1) {
-            char mv = parent.at(keys[i+1]).second;
-            if (mv) result.push_back(mv);
-            continue;
-        }
-        int pr = br - dr[d], pc = bc - dc[d];
-        int pidx = pr*cols + pc;
-        // BFS walk on ps (player can step on fragile!)
-        string walk = bfs_player_path(ps, ps.player, pidx);
-        result += walk;
-        result.push_back(dir_char[d]);
+        auto [br,bc]=id_to_rc[b]; auto [tr,tc]=id_to_rc[t];
+        int d=-1;
+        for(int dd=0;dd<4;++dd) if(br+dr[dd]==tr && bc+dc[dd]==tc){ d=dd; break; }
+        if(d==-1){ char mv=parent.at(keys[i+1]).second; if(mv) result.push_back(mv); continue; }
+        int pr=br-dr[d], pc=bc-dc[d]; int pidx=pr*cols+pc;
+        string walk=bfs_player_path(ps, ps.player, pidx);
+        result+=walk; result.push_back(dir_char[d]);
     }
     return result;
 }
 
-// ---------- A* push-based solver (optimal) ----------
-pair<int,string> astar_push_solver(const State &start) {
-    int N = rows*cols;
-    compute_dist_to_targets();
-    for (int i=0;i<N;++i) if (start.boxes[i]) {
-        if (fragile[i]) return {-1,""}; // invalid (boxes on fragile) — assignment says input valid though
-        if (dist_to_target[i] == INT_MAX) return {-1,""};
-    }
+// ---------- Beam A* solver ----------
+pair<int,string> astar_push_solver(const State &start){
+    int N=rows*cols;
+    manhattan_target_r.clear(); manhattan_target_c.clear();
+    for(int i=0;i<N;++i) if(targets[i]){ manhattan_target_r.push_back(id_to_rc[i].first); manhattan_target_c.push_back(id_to_rc[i].second); }
 
-    struct Node {
-        int f;
-        int g;
-        State s;
-        bool operator<(const Node &o) const {
-            if (f != o.f) return f > o.f; // min-heap
-            return g < o.g;
+    struct Node{
+        int f,g; State s;
+        bool operator<(const Node &o) const{
+            if(f!=o.f) return f>o.f; return g<o.g;
         }
     };
 
     priority_queue<Node> pq;
     unordered_map<string,int> best_g;
-    unordered_map<string, pair<string,char>> parent; // child -> (parent_key, push_char)
+    unordered_map<string,pair<string,char>> parent;
 
-    int h0 = heuristic_sum(start);
-    if (h0 >= INT_MAX/4) return {-1,""};
-    string sk = state_key(start);
-    best_g[sk] = 0;
-    parent[sk] = make_pair(string(), (char)0);
-    pq.push(Node{h0, 0, start});
+    int h0=heuristic_sum(start);
+    string sk=state_key(start);
+    best_g[sk]=0; parent[sk]={string(),0};
+    pq.push(Node{h0,0,start});
 
-    while (!pq.empty()) {
-        Node cur = pq.top(); pq.pop();
-        State s = cur.s;
-        int g = cur.g;
-        string key = state_key(s);
-        auto itg = best_g.find(key);
-        if (itg != best_g.end() && g != itg->second) continue;
+    while(!pq.empty()){
+        vector<Node> next_level;
+        while(!pq.empty()){
+            Node cur=pq.top(); pq.pop();
+            State s=cur.s; int g=cur.g;
+            string key=state_key(s);
+            if(best_g[key]!=g) continue;
+            bool done=true;
+            for(int i=0;i<N;++i) if(s.boxes[i] && !targets[i]){ done=false; break; }
+            if(done) return {g,reconstruct_full_moves(parent,key)};
 
-        // goal test
-        bool done = true;
-        for (int i=0;i<N;++i) if (s.boxes[i] && !targets[i]) { done = false; break; }
-        if (done) {
-            string full = reconstruct_full_moves(parent, key);
-            return {g, full};
-        }
-
-        // reachable player places (player can step on fragile)
-        bitset<MAX_CELLS> reach = player_reachable(s.player, s.boxes);
-
-        // generate pushes
-        for (int b=0;b<N;++b) {
-            if (!s.boxes[b]) continue;
-            auto [br, bc] = id_to_rc[b];
-            for (int d=0; d<4; ++d) {
-                int pr = br - dr[d], pc = bc - dc[d];
-                int tr = br + dr[d], tc = bc + dc[d];
-                if (pr<0||pr>=rows||pc<0||pc>=cols) continue;
-                if (tr<0||tr>=rows||tc<0||tc>=cols) continue;
-                int pidx = pr*cols + pc;
-                int tidx = tr*cols + tc;
-                if (!reach[pidx]) continue;
-                // target cell must be free AND box-walkable (not wall, not fragile)
-                if (walls[tidx] || s.boxes[tidx] || fragile[tidx]) continue;
-                State ns = s;
-                ns.boxes[b] = 0; ns.boxes[tidx] = 1; ns.player = b;
-                if (is_deadlock_simple(ns)) continue;
-                int h = heuristic_sum(ns);
-                if (h >= INT_MAX/4) continue;
-                int ng = g + 1;
-                string nk = state_key(ns);
-                auto it = best_g.find(nk);
-                if (it == best_g.end() || ng < it->second) {
-                    best_g[nk] = ng;
-                    parent[nk] = make_pair(key, dir_char[d]);
-                    pq.push(Node{ng + h, ng, ns});
+            bitset<MAX_CELLS> reach=player_reachable(s.player, s.boxes);
+            for(int b=0;b<N;++b){
+                if(!s.boxes[b]) continue;
+                auto [br,bc]=id_to_rc[b];
+                for(int d=0;d<4;++d){
+                    int pr=br-dr[d], pc=bc-dc[d], tr=br+dr[d], tc=bc+dc[d];
+                    if(pr<0||pr>=rows||pc<0||pc>=cols) continue;
+                    if(tr<0||tr>=rows||tc<0||tc>=cols) continue;
+                    int pidx=pr*cols+pc, tidx=tr*cols+tc;
+                    if(!reach[pidx]) continue;
+                    // only forbid moving box into fragile, walls, other boxes, or dead zone
+                    if(walls[tidx] || s.boxes[tidx] || dead_zone[tidx] || fragile[tidx]) continue;
+                    State ns=s; ns.boxes[b]=0; ns.boxes[tidx]=1; ns.player=b;
+                    if(is_deadlock(ns)) continue;
+                    int h=heuristic_sum(ns), ng=g+1;
+                    string nk=state_key(ns);
+                    auto it=best_g.find(nk);
+                    if(it==best_g.end() || ng<it->second){
+                        best_g[nk]=ng; parent[nk]={key,dir_char[d]};
+                        next_level.push_back(Node{ng+h, ng, ns});
+                    }
                 }
             }
         }
+        sort(next_level.begin(), next_level.end(), [](Node &a, Node &b){ return a.f < b.f; });
+        if((int)next_level.size()>BEAM_WIDTH) next_level.resize(BEAM_WIDTH);
+        for(auto &n : next_level) pq.push(n);
     }
     return {-1,""};
 }
 
 // ---------- Main ----------
-int main(int argc, char** argv) {
-    ios::sync_with_stdio(false);
-    cin.tie(nullptr);
-
-    if (argc < 2) { cerr<<"Usage: "<<argv[0]<<" level.txt\n"; return 1; }
-    ifstream fin(argv[1]);
-    if (!fin) { cerr<<"Cannot open "<<argv[1]<<"\n"; return 1; }
-
+int main(int argc,char** argv){
+    ios::sync_with_stdio(false); cin.tie(nullptr);
+    if(argc<2){ cerr<<"Usage: "<<argv[0]<<" level.txt\n"; return 1; }
+    ifstream fin(argv[1]); if(!fin){ cerr<<"Cannot open "<<argv[1]<<"\n"; return 1; }
     vector<string> lines; string line;
-    while (getline(fin, line)) lines.push_back(line);
-    if (lines.empty()) { cerr<<"Empty file\n"; return 1; }
+    while(getline(fin,line)) lines.push_back(line);
+    if(lines.empty()){ cerr<<"Empty file\n"; return 1; }
+    rows=(int)lines.size(); cols=(int)lines[0].size();
+    if(rows*cols>=MAX_CELLS){ cerr<<"Map too large\n"; return 1; }
 
-    rows = (int)lines.size();
-    cols = (int)lines[0].size();
-    if (rows*cols >= MAX_CELLS) { cerr<<"Map too large\n"; return 1; }
-
-    State start; int idx = 0;
-    for (int r=0; r<rows; ++r) {
-        if ((int)lines[r].size() < cols) lines[r].resize(cols, ' ');
-        for (int c=0; c<cols; ++c, ++idx) {
-            id_to_rc[idx] = {r,c};
-            char ch = lines[r][c];
-            walls[idx] = (ch == '#');
-            fragile[idx] = (ch == '@' || ch == '!');
-            targets[idx] = (ch == '.' || ch == 'O' || ch == 'X');
-            start.boxes[idx] = (ch == 'x' || ch == 'X');
-            if (ch == 'o' || ch == 'O' || ch == '!') start.player = idx;
+    State start; int idx=0;
+    for(int r=0;r<rows;++r){
+        if((int)lines[r].size()<cols) lines[r].resize(cols,' ');
+        for(int c=0;c<cols;++c,++idx){
+            id_to_rc[idx]={r,c};
+            char ch=lines[r][c];
+            walls[idx]=(ch=='#');
+            fragile[idx]=(ch=='!'||ch=='@');  // only empty fragile tiles
+            targets[idx]=(ch=='.'||ch=='O'||ch=='X');
+            start.boxes[idx]=(ch=='x'||ch=='X');
+            if(ch=='o'||ch=='O'||ch=='@'||ch=='!') start.player=idx; // player can start on fragile tile
         }
     }
 
-    auto t0 = chrono::high_resolution_clock::now();
-    auto res = astar_push_solver(start);
-    auto t1 = chrono::high_resolution_clock::now();
-    double elapsed = chrono::duration_cast<chrono::duration<double>>(t1 - t0).count();
-
-    if (res.first >= 0) {
-        cout << "Solution found with pushes = " << res.first << "\n";
-        cout << "Full moves (WASD): " << res.second << "\n";
-    } else {
-        cout << "No solution found by A*\n";
+    // Precompute dead zones (corners with no target)
+    for(int i=0;i<rows*cols;++i){
+        if(walls[i] || targets[i]) continue;
+        auto [r,c]=id_to_rc[i];
+        bool up=(r==0 || walls[(r-1)*cols+c]), down=(r==rows-1 || walls[(r+1)*cols+c]);
+        bool left=(c==0 || walls[r*cols+(c-1)]), right=(c==cols-1 || walls[r*cols+(c+1)]);
+        if((up||down)&&(left||right)) dead_zone[i]=true;
     }
-    cout << "Elapsed time: " << elapsed << " seconds\n";
+
+    auto res=astar_push_solver(start);
+    if(res.first>=0) cout<<res.second<<"\n";
+    else cout<<"No solution found by Beam-A*\n";
     return 0;
 }
