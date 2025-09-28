@@ -2,7 +2,6 @@
 // Execute: srun -A ACD114118 -n1 -c${threads} ./hw1 ${input}
 
 #include <bits/stdc++.h>
-#include <omp.h>
 using namespace std;
 
 const int MAX_CELLS = 256;
@@ -81,49 +80,31 @@ bool is_deadlock_simple(const State &s) {
     return false;
 }
 
-// is_deadlock uses Static Deadlocks + the new, safer Perimeter Check
+// is_deadlock now includes the simple checks + a frozen box check
 bool is_deadlock(const State &s) {
     if(is_deadlock_simple(s)) return true;
     int N = rows*cols;
     
     for(int i=0;i<N;++i){
         if(!s.boxes[i]) continue;
-        if(targets[i]) continue;
+        if(targets[i]) continue; // Boxes on target are fine
         
-        // Static Dead Zones (original corners + 2x2 precomputed)
+        // --- ADDED: Static Dead Zones (precomputed) ---
         if(dead_zone[i]) return true;
         
-        // --- ADDED: Balanced Perimeter Deadlock Check ---
+        // --- ADDED: Frozen Box (run-time check) ---
+        // Check if the box is blocked in both vertical and both horizontal directions
         auto [r,c] = id_to_rc[i];
-
-        // Hard Blockers: Walls or Map Edges (Cannot be moved)
-        auto is_wall_blocked = [&](int rr, int cc) -> bool {
-            if (rr < 0 || rr >= rows || cc < 0 || cc >= cols) return true;
-            return walls[rr * cols + cc];
-        };
-        
-        // Any Blocker: Walls, Map Edges, OR Boxes (Used for the perpendicular axis)
-        auto is_blocked_any = [&](int rr, int cc) -> bool {
+        auto is_blocked = [&](int rr, int cc) -> bool {
             if (rr < 0 || rr >= rows || cc < 0 || cc >= cols) return true;
             int idx = rr * cols + cc;
             return walls[idx] || s.boxes[idx];
         };
-
-        // Condition 1: Trapped horizontally by walls AND blocked vertically by ANY obstacle
-        // (The box is in a vertical corridor pinned by walls/edges)
-        bool wall_block_h = is_wall_blocked(r, c-1) && is_wall_blocked(r, c+1);
-        if (wall_block_h) {
-            bool blocked_any_v = is_blocked_any(r-1, c) && is_blocked_any(r+1, c);
-            if (blocked_any_v) return true;
-        }
-
-        // Condition 2: Trapped vertically by walls AND blocked horizontally by ANY obstacle
-        // (The box is in a horizontal corridor pinned by walls/edges)
-        bool wall_block_v = is_wall_blocked(r-1, c) && is_wall_blocked(r+1, c);
-        if (wall_block_v) {
-            bool blocked_any_h = is_blocked_any(r, c-1) && is_blocked_any(r, c+1);
-            if (blocked_any_h) return true;
-        }
+        
+        bool blocked_v = is_blocked(r-1, c) && is_blocked(r+1, c);
+        bool blocked_h = is_blocked(r, c-1) && is_blocked(r, c+1);
+        
+        if (blocked_v && blocked_h) return true;
     }
     return false;
 }
@@ -250,8 +231,6 @@ pair<int,string> astar_push_solver(const State &start, int beam_width){
     };
 
     priority_queue<Node> pq;
-    // NOTE: unordered_map access needs careful synchronization.
-    // Given the nature of A* (and Beam A*), only writes need protection.
     unordered_map<State,int,StateHash,StateEqual> best_g;
     unordered_map<string,pair<string,char>> parent; 
 
@@ -264,103 +243,55 @@ pair<int,string> astar_push_solver(const State &start, int beam_width){
     pq.push(Node{h0,0,start});
 
     while(!pq.empty()){
-        vector<Node> current_level;
+        vector<Node> next_level;
         while(!pq.empty()){
-            current_level.push_back(pq.top());
-            pq.pop();
-        }
-        
-        // Parallelize the expansion of nodes in the current level
-        // 'next_level' is now a list of thread-local vectors
-        vector<vector<Node>> thread_next_level(omp_get_max_threads());
-
-        // The OpenMP loop runs in parallel
-        #pragma omp parallel for default(none) shared(current_level, N, best_g, parent, thread_next_level, beam_width, targets, id_to_rc, dr, dc, rows, cols, walls, fragile, dead_zone, dir_char) 
-        for(size_t i=0; i<current_level.size(); ++i){
-            Node cur=current_level[i]; 
+            Node cur=pq.top(); pq.pop();
             State s=cur.s; int g=cur.g;
-            int thread_id = omp_get_thread_num();
-
-            // Find current best_g (Read access is okay, but map update must be protected)
+            
             auto it_g = best_g.find(s);
             if(it_g==best_g.end() || it_g->second != g) continue; 
             
             string key=state_key(s);
             
-            // Check for goal state (Read access is safe)
             bool done=true;
-            // targets is a shared global variable
-            for(int j=0;j<N;++j) if(s.boxes[j] && !targets[j]){ done=false; break; }
-            if(done) {
-                continue; 
-            }
+            for(int i=0;i<N;++i) if(s.boxes[i] && !targets[i]){ done=false; break; }
+            if(done) return {g,reconstruct_full_moves(parent,key)};
 
             bitset<MAX_CELLS> reach=player_reachable(s.player, s.boxes);
             for(int b=0;b<N;++b){
                 if(!s.boxes[b]) continue;
-                // id_to_rc is a shared global variable
                 auto [br,bc]=id_to_rc[b];
                 for(int d=0;d<4;++d){
-                    // dr, dc are shared global variables
                     int pr=br-dr[d], pc=bc-dc[d], tr=br+dr[d], tc=bc+dc[d];
-                    // rows, cols are shared global variables
                     if(pr<0||pr>=rows||pc<0||pc>=cols) continue;
                     if(tr<0||tr>=rows||tc<0||tc>=cols) continue;
                     int pidx=pr*cols+pc, tidx=tr*cols+tc;
                     if(!reach[pidx]) continue;
-                    // walls, fragile, dead_zone are shared global variables
                     if(walls[tidx] || s.boxes[tidx] || fragile[tidx] || dead_zone[tidx]) continue;
                     State ns=s; ns.boxes[b]=0; ns.boxes[tidx]=1; ns.player=b;
                     if(is_deadlock(ns)) continue;
                     int h=heuristic_sum(ns), ng=g+1;
                     
-                    // CRITICAL SECTION: Write access to shared maps
-                    #pragma omp critical
-                    {
-                        auto it=best_g.find(ns);
-                        if(it==best_g.end() || ng<it->second){
-                            best_g[ns]=ng; 
-                            string nk=state_key(ns);
-                            // dir_char is a shared global variable
-                            parent[nk]={key,dir_char[d]}; 
-                            // Add to thread-local list
-                            thread_next_level[thread_id].push_back(Node{ng+h, ng, ns});
-                        }
-                    } // End Critical Section
+                    auto it=best_g.find(ns);
+                    if(it==best_g.end() || ng<it->second){
+                        best_g[ns]=ng; 
+                        string nk=state_key(ns);
+                        parent[nk]={key,dir_char[d]}; 
+                        next_level.push_back(Node{ng+h, ng, ns});
+                    }
                 }
             }
-        } // End OpenMP parallel for
-
-        // Merge thread-local results into a single vector
-        vector<Node> next_level;
-        for(auto &vec : thread_next_level){
-            next_level.insert(next_level.end(), vec.begin(), vec.end());
         }
-
-        // Sort and select the beam width (Sequential part)
         sort(next_level.begin(), next_level.end(), [](Node &a, Node &b){ return a.f < b.f; });
         if((int)next_level.size()>beam_width) next_level.resize(beam_width);
-        
-        // Add to priority queue for the next iteration (Sequential part)
         for(auto &n : next_level) pq.push(n);
-
-        // Check the current level for the goal state again (as we skipped immediate returns in the parallel loop)
-        for (const auto& cur : current_level) {
-            State s = cur.s;
-            bool done = true;
-            for(int j=0; j<N; ++j) if(s.boxes[j] && !targets[j]){ done=false; break; }
-            if(done) {
-                return {cur.g, reconstruct_full_moves(parent, state_key(s))};
-            }
-        }
-
     }
     return {-1,""};
 }
 
 // ---------- Main (MODIFIED) ----------
 int main(int argc,char** argv){
-    ios::sync_with_stdio(false); cin.tie(nullptr);
+    // ios::sync_with_stdio(false); cin.tie(nullptr);
     if(argc<2){ cerr<<"Usage: "<<argv[0]<<" level.txt\n"; return 1; }
     ifstream fin(argv[1]); if(!fin){ cerr<<"Cannot open "<<argv[1]<<"\n"; return 1; }
     vector<string> lines; string line;
@@ -394,26 +325,28 @@ int main(int argc,char** argv){
         if((up||down)&&(left||right)) dead_zone[i]=true;
     }
     
-    // --- ADDED: 2x2 Static Deadlock Precomputation ---
-    for(int r=1; r<rows-1; ++r) {
-        for(int c=1; c<cols-1; ++c) {
-            // Check all 4 cells in the 2x2 block
+    // --- ADDED: Advanced Static Deadlock Precomputation ---
+    for(int r=0; r<rows-1; ++r) {
+        for(int c=0; c<cols-1; ++c) {
             int i00 = r*cols+c, i10 = (r+1)*cols+c, i01 = r*cols+(c+1), i11 = (r+1)*cols+(c+1);
             
-            // Only consider 2x2 blocks of non-target cells
+            // 2x2 Deadlocks (A, B, C, D are the corners of the 2x2 non-target block)
+            // Pattern: Two adjacent non-target corners blocked by walls on 2 adjacent outer sides.
+            
+            // Check top-left block: i00, i10, i01, i11
             if (!targets[i00] && !targets[i10] && !targets[i01] && !targets[i11]) {
                 
-                // Case 1: i00 trapped by Wall Left and Wall Above
-                if (walls[i00 - 1] && walls[i00 - cols]) dead_zone[i00]=true;
+                // Case 1: Wall above (r-1) and left (c-1)
+                if (walls[(r-1)*cols+c] && walls[r*cols+(c-1)]) dead_zone[i00]=true;
                 
-                // Case 2: i01 trapped by Wall Right and Wall Above
-                if (walls[i01 + 1] && walls[i01 - cols]) dead_zone[i01]=true;
+                // Case 2: Wall above (r-1) and right (c+2)
+                if (walls[(r-1)*cols+(c+1)] && walls[r*cols+(c+2)]) dead_zone[i01]=true;
 
-                // Case 3: i10 trapped by Wall Left and Wall Below
-                if (walls[i10 - 1] && walls[i10 + cols]) dead_zone[i10]=true;
+                // Case 3: Wall below (r+2) and left (c-1)
+                if (walls[(r+2)*cols+c] && walls[(r+1)*cols+(c-1)]) dead_zone[i10]=true;
 
-                // Case 4: i11 trapped by Wall Right and Wall Below
-                if (walls[i11 + 1] && walls[i11 + cols]) dead_zone[i11]=true;
+                // Case 4: Wall below (r+2) and right (c+2)
+                if (walls[(r+2)*cols+(c+1)] && walls[(r+1)*cols+(c+2)]) dead_zone[i11]=true;
             }
         }
     }

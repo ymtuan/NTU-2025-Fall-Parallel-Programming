@@ -2,3 +2,4 @@ hw1
 output.txt
 
 __pycache__/
+.vscode

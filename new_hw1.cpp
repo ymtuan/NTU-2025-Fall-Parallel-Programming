@@ -2,7 +2,6 @@
 // Execute: srun -A ACD114118 -n1 -c${threads} ./hw1 ${input}
 
 #include <bits/stdc++.h>
-#include <omp.h>
 using namespace std;
 
 const int MAX_CELLS = 256;
@@ -250,8 +249,6 @@ pair<int,string> astar_push_solver(const State &start, int beam_width){
     };
 
     priority_queue<Node> pq;
-    // NOTE: unordered_map access needs careful synchronization.
-    // Given the nature of A* (and Beam A*), only writes need protection.
     unordered_map<State,int,StateHash,StateEqual> best_g;
     unordered_map<string,pair<string,char>> parent; 
 
@@ -264,96 +261,48 @@ pair<int,string> astar_push_solver(const State &start, int beam_width){
     pq.push(Node{h0,0,start});
 
     while(!pq.empty()){
-        vector<Node> current_level;
+        vector<Node> next_level;
         while(!pq.empty()){
-            current_level.push_back(pq.top());
-            pq.pop();
-        }
-        
-        // Parallelize the expansion of nodes in the current level
-        // 'next_level' is now a list of thread-local vectors
-        vector<vector<Node>> thread_next_level(omp_get_max_threads());
-
-        // The OpenMP loop runs in parallel
-        #pragma omp parallel for default(none) shared(current_level, N, best_g, parent, thread_next_level, beam_width, targets, id_to_rc, dr, dc, rows, cols, walls, fragile, dead_zone, dir_char) 
-        for(size_t i=0; i<current_level.size(); ++i){
-            Node cur=current_level[i]; 
+            Node cur=pq.top(); pq.pop();
             State s=cur.s; int g=cur.g;
-            int thread_id = omp_get_thread_num();
-
-            // Find current best_g (Read access is okay, but map update must be protected)
+            
             auto it_g = best_g.find(s);
             if(it_g==best_g.end() || it_g->second != g) continue; 
             
             string key=state_key(s);
             
-            // Check for goal state (Read access is safe)
             bool done=true;
-            // targets is a shared global variable
-            for(int j=0;j<N;++j) if(s.boxes[j] && !targets[j]){ done=false; break; }
-            if(done) {
-                continue; 
-            }
+            for(int i=0;i<N;++i) if(s.boxes[i] && !targets[i]){ done=false; break; }
+            if(done) return {g,reconstruct_full_moves(parent,key)};
 
             bitset<MAX_CELLS> reach=player_reachable(s.player, s.boxes);
             for(int b=0;b<N;++b){
                 if(!s.boxes[b]) continue;
-                // id_to_rc is a shared global variable
                 auto [br,bc]=id_to_rc[b];
                 for(int d=0;d<4;++d){
-                    // dr, dc are shared global variables
                     int pr=br-dr[d], pc=bc-dc[d], tr=br+dr[d], tc=bc+dc[d];
-                    // rows, cols are shared global variables
                     if(pr<0||pr>=rows||pc<0||pc>=cols) continue;
                     if(tr<0||tr>=rows||tc<0||tc>=cols) continue;
                     int pidx=pr*cols+pc, tidx=tr*cols+tc;
                     if(!reach[pidx]) continue;
-                    // walls, fragile, dead_zone are shared global variables
                     if(walls[tidx] || s.boxes[tidx] || fragile[tidx] || dead_zone[tidx]) continue;
                     State ns=s; ns.boxes[b]=0; ns.boxes[tidx]=1; ns.player=b;
                     if(is_deadlock(ns)) continue;
                     int h=heuristic_sum(ns), ng=g+1;
                     
-                    // CRITICAL SECTION: Write access to shared maps
-                    #pragma omp critical
-                    {
-                        auto it=best_g.find(ns);
-                        if(it==best_g.end() || ng<it->second){
-                            best_g[ns]=ng; 
-                            string nk=state_key(ns);
-                            // dir_char is a shared global variable
-                            parent[nk]={key,dir_char[d]}; 
-                            // Add to thread-local list
-                            thread_next_level[thread_id].push_back(Node{ng+h, ng, ns});
-                        }
-                    } // End Critical Section
+                    auto it=best_g.find(ns);
+                    if(it==best_g.end() || ng<it->second){
+                        best_g[ns]=ng; 
+                        string nk=state_key(ns);
+                        parent[nk]={key,dir_char[d]}; 
+                        next_level.push_back(Node{ng+h, ng, ns});
+                    }
                 }
             }
-        } // End OpenMP parallel for
-
-        // Merge thread-local results into a single vector
-        vector<Node> next_level;
-        for(auto &vec : thread_next_level){
-            next_level.insert(next_level.end(), vec.begin(), vec.end());
         }
-
-        // Sort and select the beam width (Sequential part)
         sort(next_level.begin(), next_level.end(), [](Node &a, Node &b){ return a.f < b.f; });
         if((int)next_level.size()>beam_width) next_level.resize(beam_width);
-        
-        // Add to priority queue for the next iteration (Sequential part)
         for(auto &n : next_level) pq.push(n);
-
-        // Check the current level for the goal state again (as we skipped immediate returns in the parallel loop)
-        for (const auto& cur : current_level) {
-            State s = cur.s;
-            bool done = true;
-            for(int j=0; j<N; ++j) if(s.boxes[j] && !targets[j]){ done=false; break; }
-            if(done) {
-                return {cur.g, reconstruct_full_moves(parent, state_key(s))};
-            }
-        }
-
     }
     return {-1,""};
 }
