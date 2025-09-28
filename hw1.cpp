@@ -6,6 +6,7 @@
 using namespace std;
 
 const int MAX_CELLS = 256;
+const int INF = 1000000007;
 struct State {
     int player;
     bitset<MAX_CELLS> boxes;
@@ -161,22 +162,56 @@ string bfs_player_path(const State &s,int from_idx,int to_idx){
     return string(steps.begin(), steps.end());
 }
 
-// ---------- Heuristic (unchanged) ----------
+// ---------- Heuristic (improved with Hungarian assignment) ----------
 vector<int> manhattan_target_r, manhattan_target_c;
 int heuristic_sum(const State &s){
-    int h=0;
     int N=rows*cols;
     vector<pair<int,int>> box_positions;
     for(int i=0;i<N;++i) if(s.boxes[i]) box_positions.push_back(id_to_rc[i]);
-    for(auto [br,bc]: box_positions){
-        int best=INT_MAX;
-        for(size_t t=0;t<manhattan_target_r.size();++t){
-            int d=abs(br-manhattan_target_r[t])+abs(bc-manhattan_target_c[t]);
-            best=min(best,d);
+    int n = box_positions.size();
+    if (n == 0) return 0;
+
+    vector<vector<int>> A(n+1, vector<int>(n+1, 0));
+    for(int i=0; i<n; ++i){
+        auto [br, bc] = box_positions[i];
+        for(int j=0; j<n; ++j){
+            int d = abs(br - manhattan_target_r[j]) + abs(bc - manhattan_target_c[j]);
+            A[i+1][j+1] = d;
         }
-        h+=best;
     }
-    return h;
+
+    vector<int> u(n+1), v(n+1), p(n+1), way(n+1);
+    for (int i=1; i<=n; ++i) {
+        p[0] = i;
+        int j0 = 0;
+        vector<int> minv(n+1, INF);
+        vector<bool> used(n+1, false);
+        do {
+            used[j0] = true;
+            int i0 = p[j0], delta = INF, j1;
+            for (int j=1; j<=n; ++j)
+                if (!used[j]) {
+                    int cur = A[i0][j] - u[i0] - v[j];
+                    if (cur < minv[j])
+                        minv[j] = cur, way[j] = j0;
+                    if (minv[j] < delta)
+                        delta = minv[j], j1 = j;
+                }
+            for (int j=0; j<=n; ++j)
+                if (used[j])
+                    u[p[j]] += delta, v[j] -= delta;
+                else
+                    minv[j] -= delta;
+            j0 = j1;
+        } while (p[j0] != 0);
+        do {
+            int j1 = way[j0];
+            p[j0] = p[j1];
+            j0 = j1;
+        } while (j0);
+    }
+
+    return -v[0];
 }
 
 // ---------- Reconstruct moves (MODIFIED) ----------
@@ -229,8 +264,8 @@ string reconstruct_full_moves(const unordered_map<State, pair<State, char>, Stat
     return result;
 }
 
-// ---------- Beam A* solver (MODIFIED) ----------
-pair<int,string> astar_push_solver(const State &start, int beam_width){
+// ---------- Beam A* solver (MODIFIED with adaptive branching estimation) ----------
+pair<int,string> astar_push_solver(const State &start, int beam_width, long long initial_branching){
     int N=rows*cols;
     manhattan_target_r.clear(); manhattan_target_c.clear();
     for(int i=0;i<N;++i) if(targets[i]){ manhattan_target_r.push_back(id_to_rc[i].first); manhattan_target_c.push_back(id_to_rc[i].second); }
@@ -243,8 +278,6 @@ pair<int,string> astar_push_solver(const State &start, int beam_width){
     };
 
     priority_queue<Node> pq;
-    // NOTE: unordered_map access needs careful synchronization.
-    // Given the nature of A* (and Beam A*), only writes need protection.
     unordered_map<State,int,StateHash,StateEqual> best_g;
     unordered_map<State,pair<State,char>,StateHash,StateEqual> parent; 
 
@@ -255,6 +288,8 @@ pair<int,string> astar_push_solver(const State &start, int beam_width){
     
     pq.push(Node{h0,0,start});
 
+    long long last_raw_per_node = 0;
+
     while(!pq.empty()){
         vector<Node> current_level;
         while(!pq.empty()){
@@ -262,76 +297,159 @@ pair<int,string> astar_push_solver(const State &start, int beam_width){
             pq.pop();
         }
         
-        // Parallelize the expansion of nodes in the current level
-        // 'next_level' is now a list of thread-local vectors
-        vector<vector<Node>> thread_next_level(omp_get_max_threads());
+        // Estimate candidates to decide pruning strategy
+        long long est_branching = last_raw_per_node > 0 ? last_raw_per_node : initial_branching;
+        long long estimated_candidates = (long long)current_level.size() * est_branching;
+        bool use_deferred = estimated_candidates <= (long long)beam_width * 5LL;
 
-        // The OpenMP loop runs in parallel
-        #pragma omp parallel for default(none) shared(current_level, N, best_g, parent, thread_next_level, beam_width, targets, id_to_rc, dr, dc, rows, cols, walls, fragile, dead_zone, dir_char) 
-        for(size_t i=0; i<current_level.size(); ++i){
-            Node cur=current_level[i]; 
-            State s=cur.s; int g=cur.g;
-            int thread_id = omp_get_thread_num();
+        vector<Node> next_level_candidates;
+        long long raw_generated = 0;
 
-            // Find current best_g (Read access is okay, but map update must be protected)
-            auto it_g = best_g.find(s);
-            if(it_g==best_g.end() || it_g->second != g) continue; 
-            
-            
-            // Check for goal state (Read access is safe)
-            bool done=true;
-            // targets is a shared global variable
-            for(int j=0;j<N;++j) if(s.boxes[j] && !targets[j]){ done=false; break; }
-            if(done) {
-                continue; 
+        if (use_deferred) {
+            // Deferred pruning (new version, for low branching)
+            vector<vector<pair<Node, pair<State, char>>>> thread_candidates(omp_get_max_threads());
+
+            #pragma omp parallel for default(none) shared(current_level, N, best_g, thread_candidates, targets, id_to_rc, dr, dc, rows, cols, walls, fragile, dead_zone, dir_char) 
+            for(size_t i=0; i<current_level.size(); ++i){
+                Node cur=current_level[i]; 
+                State s=cur.s; int g=cur.g;
+                int thread_id = omp_get_thread_num();
+
+                // Skip if not current best g (read-only check)
+                auto it_g = best_g.find(s);
+                if(it_g==best_g.end() || it_g->second != g) continue; 
+                
+                // Check for goal state
+                bool done=true;
+                for(int j=0;j<N;++j) if(s.boxes[j] && !targets[j]){ done=false; break; }
+                if(done) {
+                    continue; 
+                }
+
+                bitset<MAX_CELLS> reach=player_reachable(s.player, s.boxes);
+                for(int b=0;b<N;++b){
+                    if(!s.boxes[b]) continue;
+                    auto [br,bc]=id_to_rc[b];
+                    for(int d=0;d<4;++d){
+                        int pr=br-dr[d], pc=bc-dc[d], tr=br+dr[d], tc=bc+dc[d];
+                        if(pr<0||pr>=rows||pc<0||pc>=cols) continue;
+                        if(tr<0||tr>=rows||tc<0||tc>=cols) continue;
+                        int pidx=pr*cols+pc, tidx=tr*cols+tc;
+                        if(!reach[pidx]) continue;
+                        if(walls[tidx] || s.boxes[tidx] || fragile[tidx] || dead_zone[tidx]) continue;
+                        State ns=s; ns.boxes[b]=0; ns.boxes[tidx]=1; ns.player=b;
+                        if(is_deadlock(ns)) continue;
+                        int h=heuristic_sum(ns), ng=g+1;
+                        
+                        // Collect candidate without checking best_g
+                        thread_candidates[thread_id].push_back({Node{ng+h, ng, ns}, {s, dir_char[d]}});
+                    }
+                }
+            } // End OpenMP parallel for
+
+            // Merge thread-local candidates
+            vector<pair<Node, pair<State, char>>> candidates;
+            for(auto &vec : thread_candidates){
+                candidates.insert(candidates.end(), vec.begin(), vec.end());
             }
+            raw_generated = candidates.size();
 
-            bitset<MAX_CELLS> reach=player_reachable(s.player, s.boxes);
-            for(int b=0;b<N;++b){
-                if(!s.boxes[b]) continue;
-                // id_to_rc is a shared global variable
-                auto [br,bc]=id_to_rc[b];
-                for(int d=0;d<4;++d){
-                    // dr, dc are shared global variables
-                    int pr=br-dr[d], pc=bc-dc[d], tr=br+dr[d], tc=bc+dc[d];
-                    // rows, cols are shared global variables
-                    if(pr<0||pr>=rows||pc<0||pc>=cols) continue;
-                    if(tr<0||tr>=rows||tc<0||tc>=cols) continue;
-                    int pidx=pr*cols+pc, tidx=tr*cols+tc;
-                    if(!reach[pidx]) continue;
-                    // walls, fragile, dead_zone are shared global variables
-                    if(walls[tidx] || s.boxes[tidx] || fragile[tidx] || dead_zone[tidx]) continue;
-                    State ns=s; ns.boxes[b]=0; ns.boxes[tidx]=1; ns.player=b;
-                    if(is_deadlock(ns)) continue;
-                    int h=heuristic_sum(ns), ng=g+1;
-                    
-                    // CRITICAL SECTION: Write access to shared maps
-                    #pragma omp critical
-                    {
-                        auto it=best_g.find(ns);
-                        if(it==best_g.end() || ng<it->second){
-                            best_g[ns]=ng; 
-                            parent[ns]={s,dir_char[d]}; 
-                            // Add to thread-local list
-                            thread_next_level[thread_id].push_back(Node{ng+h, ng, ns});
-                        }
-                    } // End Critical Section
+            // Sequential pruning: update maps only for improving nodes
+            vector<Node> pruned_next;
+            pruned_next.reserve(candidates.size());
+            for(auto &cand : candidates) {
+                const Node &n = cand.first;
+                const State &ns = n.s;
+                int ng = n.g;
+                auto it = best_g.find(ns);
+                if(it == best_g.end() || ng < it->second){
+                    best_g[ns] = ng; 
+                    parent[ns] = cand.second;
+                    pruned_next.push_back(n);
                 }
             }
-        } // End OpenMP parallel for
 
-        // Merge thread-local results into a single vector
-        vector<Node> next_level;
-        for(auto &vec : thread_next_level){
-            next_level.insert(next_level.end(), vec.begin(), vec.end());
+            next_level_candidates = std::move(pruned_next);
+        } else {
+            // Critical section pruning (old version, for high branching)
+            vector<vector<Node>> thread_next_level(omp_get_max_threads());
+            vector<long long> thread_raw(omp_get_max_threads(), 0);
+
+            #pragma omp parallel for default(none) shared(current_level, N, best_g, parent, thread_next_level, thread_raw, targets, id_to_rc, dr, dc, rows, cols, walls, fragile, dead_zone, dir_char) 
+            for(size_t i=0; i<current_level.size(); ++i){
+                Node cur=current_level[i]; 
+                State s=cur.s; int g=cur.g;
+                int thread_id = omp_get_thread_num();
+
+                // Find current best_g (Read access is okay, but map update must be protected)
+                auto it_g = best_g.find(s);
+                if(it_g==best_g.end() || it_g->second != g) continue; 
+                
+                
+                // Check for goal state (Read access is safe)
+                bool done=true;
+                // targets is a shared global variable
+                for(int j=0;j<N;++j) if(s.boxes[j] && !targets[j]){ done=false; break; }
+                if(done) {
+                    continue; 
+                }
+
+                bitset<MAX_CELLS> reach=player_reachable(s.player, s.boxes);
+                for(int b=0;b<N;++b){
+                    if(!s.boxes[b]) continue;
+                    // id_to_rc is a shared global variable
+                    auto [br,bc]=id_to_rc[b];
+                    for(int d=0;d<4;++d){
+                        // dr, dc are shared global variables
+                        int pr=br-dr[d], pc=bc-dc[d], tr=br+dr[d], tc=bc+dc[d];
+                        // rows, cols are shared global variables
+                        if(pr<0||pr>=rows||pc<0||pc>=cols) continue;
+                        if(tr<0||tr>=rows||tc<0||tc>=cols) continue;
+                        int pidx=pr*cols+pc, tidx=tr*cols+tc;
+                        if(!reach[pidx]) continue;
+                        // walls, fragile, dead_zone are shared global variables
+                        if(walls[tidx] || s.boxes[tidx] || fragile[tidx] || dead_zone[tidx]) continue;
+                        State ns=s; ns.boxes[b]=0; ns.boxes[tidx]=1; ns.player=b;
+                        if(is_deadlock(ns)) continue;
+                        int h=heuristic_sum(ns), ng=g+1;
+                        
+                        thread_raw[thread_id]++;
+
+                        // CRITICAL SECTION: Write access to shared maps
+                        #pragma omp critical
+                        {
+                            auto it=best_g.find(ns);
+                            if(it==best_g.end() || ng<it->second){
+                                best_g[ns]=ng; 
+                                parent[ns]={s,dir_char[d]}; 
+                                // Add to thread-local list
+                                thread_next_level[thread_id].push_back(Node{ng+h, ng, ns});
+                            }
+                        } // End Critical Section
+                    }
+                }
+            } // End OpenMP parallel for
+
+            // Merge thread-local results into a single vector
+            for(auto &vec : thread_next_level){
+                next_level_candidates.insert(next_level_candidates.end(), vec.begin(), vec.end());
+            }
+            for(auto r : thread_raw) {
+                raw_generated += r;
+            }
         }
 
-        // Sort and select the beam width (Sequential part)
-        sort(next_level.begin(), next_level.end(), [](Node &a, Node &b){ return a.f < b.f; });
-        if((int)next_level.size()>beam_width) next_level.resize(beam_width);
+        if (current_level.size() > 0) {
+            last_raw_per_node = raw_generated / current_level.size();
+        }
+
+        // Sort and select the beam width (Sequential part with partial_sort)
+        size_t select_size = std::min((size_t)beam_width, next_level_candidates.size());
+        std::partial_sort(next_level_candidates.begin(), next_level_candidates.begin() + select_size, next_level_candidates.end(), [](const Node &a, const Node &b){ return a.f < b.f; });
+        next_level_candidates.resize(select_size);
         
         // Add to priority queue for the next iteration (Sequential part)
-        for(auto &n : next_level) pq.push(n);
+        for(auto &n : next_level_candidates) pq.push(n);
 
         // Check the current level for the goal state again (as we skipped immediate returns in the parallel loop)
         for (const auto& cur : current_level) {
@@ -347,7 +465,7 @@ pair<int,string> astar_push_solver(const State &start, int beam_width){
     return {-1,""};
 }
 
-// ---------- Main (MODIFIED) ----------
+// ---------- Main (MODIFIED to compute initial_branching) ----------
 int main(int argc,char** argv){
     ios::sync_with_stdio(false); cin.tie(nullptr);
     if(argc<2){ cerr<<"Usage: "<<argv[0]<<" level.txt\n"; return 1; }
@@ -371,6 +489,27 @@ int main(int argc,char** argv){
             if(ch=='o'||ch=='O'||ch=='!') start.player=idx;
         }
     }
+
+    // Compute initial valid pushes as proxy for initial_branching
+    int N = rows * cols;
+    bitset<MAX_CELLS> reach = player_reachable(start.player, start.boxes);
+    long long initial_branching = 0;
+    for(int b = 0; b < N; ++b) {
+        if(!start.boxes[b]) continue;
+        auto [br, bc] = id_to_rc[b];
+        for(int d = 0; d < 4; ++d) {
+            int pr = br - dr[d], pc = bc - dc[d], tr = br + dr[d], tc = bc + dc[d];
+            if(pr < 0 || pr >= rows || pc < 0 || pc >= cols) continue;
+            if(tr < 0 || tr >= rows || tc < 0 || tc >= cols) continue;
+            int pidx = pr * cols + pc, tidx = tr * cols + tc;
+            if(!reach[pidx]) continue;
+            if(walls[tidx] || start.boxes[tidx] || fragile[tidx] || dead_zone[tidx]) continue;
+            State ns = start; ns.boxes[b] = 0; ns.boxes[tidx] = 1; ns.player = b;
+            if(is_deadlock(ns)) continue;
+            ++initial_branching;
+        }
+    }
+    if(initial_branching == 0) initial_branching = 1; // Avoid zero
 
     // Precompute dead zones (corners with no target)
     for(int i=0;i<rows*cols;++i){
@@ -412,7 +551,7 @@ int main(int argc,char** argv){
     vector<int> beam_widths = {500, 5000, 30000, 60000, 100000, 200000};
     // vector<int> beam_widths = {20000, 50000, 80000, 100000};
     for(int bw : beam_widths){
-        auto res=astar_push_solver(start, bw);
+        auto res=astar_push_solver(start, bw, initial_branching);
         if(res.first>=0){
             cout<<res.second<<"\n";
             // cout<<"Solution found with beam width="<<bw<<"\n";

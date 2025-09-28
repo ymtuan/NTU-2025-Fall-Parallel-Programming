@@ -1,4 +1,4 @@
-// some parallel, pass case 22,  24 tle, 23/25 tle+
+// Grok, some parallel, 25 TLE+
 
 // Compile: g++ -std=c++17 -O3 -pthread -fopenmp hw1.cpp -o hw1
 // Execute: srun -A ACD114118 -n1 -c${threads} ./hw1 ${input}
@@ -41,25 +41,7 @@ vector<pair<int,int>> id_to_rc(MAX_CELLS);
 int dr[4] = {-1,1,0,0}, dc[4] = {0,0,-1,1};
 char dir_char[4] = {'W','S','A','D'}; // up, down, left, right
 
-// ---------- Utilities (unchanged) ----------
-inline string state_key(const State &s) {
-    string k;
-    k.reserve(rows*cols + 8);
-    for (int i = 0; i < rows*cols; ++i) k.push_back(s.boxes[i] ? '1' : '0');
-    k.push_back('|');
-    k += to_string(s.player);
-    return k;
-}
-
-State parse_state_key(const string &k) {
-    State s;
-    int sep = k.find('|');
-    string b = k.substr(0, sep);
-    int N = rows*cols;
-    for (int i = 0; i < N && i < (int)b.size(); ++i) s.boxes[i] = (b[i] == '1');
-    s.player = stoi(k.substr(sep+1));
-    return s;
-}
+// ---------- Utilities (removed state_key and parse_state_key) ----------
 
 inline bool in_bounds_idx(int idx) { return idx >=0 && idx < rows*cols; }
 
@@ -199,22 +181,23 @@ int heuristic_sum(const State &s){
     return h;
 }
 
-// ---------- Reconstruct moves (unchanged) ----------
-string reconstruct_full_moves(const unordered_map<string,pair<string,char>> &parent,const string &goal_key){
-    vector<string> keys; string cur=goal_key;
+// ---------- Reconstruct moves (MODIFIED) ----------
+string reconstruct_full_moves(const unordered_map<State, pair<State, char>, StateHash, StateEqual> &parent, const State &goal){
+    vector<State> states;
+    State cur = goal;
     while(true){
-        keys.push_back(cur);
-        auto it=parent.find(cur);
-        if(it==parent.end()) break;
-        const string &pk=it->second.first;
-        if(pk.empty()) break;
-        cur=pk;
+        states.push_back(cur);
+        auto it = parent.find(cur);
+        if(it == parent.end()) break;
+        State pk = it->second.first;
+        if(pk.player == -1) break;
+        cur = pk;
     }
-    reverse(keys.begin(), keys.end());
+    reverse(states.begin(), states.end());
     string result;
-    for(size_t i=0;i+1<keys.size();++i){
-        State ps=parse_state_key(keys[i]);
-        State cs=parse_state_key(keys[i+1]);
+    for(size_t i=0;i+1<states.size();++i){
+        State ps = states[i];
+        State cs = states[i+1];
         int b=-1, t=-1; int N=rows*cols;
         for(int idx=0;idx<N;++idx){
             if(ps.boxes[idx] && !cs.boxes[idx]){ b=idx; break; }
@@ -223,14 +206,24 @@ string reconstruct_full_moves(const unordered_map<string,pair<string,char>> &par
             if(!ps.boxes[idx] && cs.boxes[idx]){ t=idx; break; }
         }
         if(b==-1 || t==-1){
-            char mv=parent.at(keys[i+1]).second;
-            if(mv) result.push_back(mv);
+            auto it = parent.find(cs);
+            if(it != parent.end()) {
+                char mv = it->second.second;
+                if(mv) result.push_back(mv);
+            }
             continue;
         }
         auto [br,bc]=id_to_rc[b]; auto [tr,tc]=id_to_rc[t];
         int d=-1;
         for(int dd=0;dd<4;++dd) if(br+dr[dd]==tr && bc+dc[dd]==tc){ d=dd; break; }
-        if(d==-1){ char mv=parent.at(keys[i+1]).second; if(mv) result.push_back(mv); continue; }
+        if(d==-1){ 
+            auto it = parent.find(cs);
+            if(it != parent.end()) {
+                char mv = it->second.second;
+                if(mv) result.push_back(mv);
+            }
+            continue; 
+        }
         int pr=br-dr[d], pc=bc-dc[d]; int pidx=pr*cols+pc;
         string walk=bfs_player_path(ps, ps.player, pidx);
         result+=walk; result.push_back(dir_char[d]);
@@ -238,7 +231,7 @@ string reconstruct_full_moves(const unordered_map<string,pair<string,char>> &par
     return result;
 }
 
-// ---------- Beam A* solver (unchanged) ----------
+// ---------- Beam A* solver (MODIFIED) ----------
 pair<int,string> astar_push_solver(const State &start, int beam_width){
     int N=rows*cols;
     manhattan_target_r.clear(); manhattan_target_c.clear();
@@ -255,13 +248,12 @@ pair<int,string> astar_push_solver(const State &start, int beam_width){
     // NOTE: unordered_map access needs careful synchronization.
     // Given the nature of A* (and Beam A*), only writes need protection.
     unordered_map<State,int,StateHash,StateEqual> best_g;
-    unordered_map<string,pair<string,char>> parent; 
+    unordered_map<State,pair<State,char>,StateHash,StateEqual> parent; 
 
     int h0=heuristic_sum(start);
     
     best_g[start]=0; 
-    string sk=state_key(start);
-    parent[sk]={string(),0};
+    parent[start] = {State{-1, bitset<MAX_CELLS>{}}, 0};
     
     pq.push(Node{h0,0,start});
 
@@ -287,7 +279,6 @@ pair<int,string> astar_push_solver(const State &start, int beam_width){
             auto it_g = best_g.find(s);
             if(it_g==best_g.end() || it_g->second != g) continue; 
             
-            string key=state_key(s);
             
             // Check for goal state (Read access is safe)
             bool done=true;
@@ -322,9 +313,7 @@ pair<int,string> astar_push_solver(const State &start, int beam_width){
                         auto it=best_g.find(ns);
                         if(it==best_g.end() || ng<it->second){
                             best_g[ns]=ng; 
-                            string nk=state_key(ns);
-                            // dir_char is a shared global variable
-                            parent[nk]={key,dir_char[d]}; 
+                            parent[ns]={s,dir_char[d]}; 
                             // Add to thread-local list
                             thread_next_level[thread_id].push_back(Node{ng+h, ng, ns});
                         }
@@ -352,7 +341,7 @@ pair<int,string> astar_push_solver(const State &start, int beam_width){
             bool done = true;
             for(int j=0; j<N; ++j) if(s.boxes[j] && !targets[j]){ done=false; break; }
             if(done) {
-                return {cur.g, reconstruct_full_moves(parent, state_key(s))};
+                return {cur.g, reconstruct_full_moves(parent, s)};
             }
         }
 
