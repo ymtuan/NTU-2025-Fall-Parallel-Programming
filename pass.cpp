@@ -466,7 +466,7 @@ int main(int argc,char** argv){
     // --- END ADDED ---
    
     // Try increasing beam widths
-    vector<int> beam_widths = {500, 5000, 30000, 60000, 100000, 200000};
+    vector<int> beam_widths = {500, 5000, 90000};
     // vector<int> beam_widths = {20000, 50000, 80000, 100000};
     for(int bw : beam_widths){
         auto res=astar_push_solver(start, bw, initial_branching);
