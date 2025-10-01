@@ -2,6 +2,7 @@
 // Execute: srun -A ACD114118 -n1 -c${threads} ./hw1 ${input}
 #include <bits/stdc++.h>
 #include <omp.h>
+#include <parallel/algorithm>
 using namespace std;
 const int MAX_CELLS = 256;
 const int INF = 1000000007;
@@ -28,9 +29,29 @@ struct StateEqual {
         return a.player == b.player && a.boxes == b.boxes;
     }
 };
+// --- START OPTIMIZATION: Custom Hash and Equality for Boxes ---
+struct BoxesHash {
+    size_t operator()(const bitset<MAX_CELLS>& bs) const {
+        size_t h = 0;
+       
+        const unsigned long long* data = (const unsigned long long*)&bs;
+        constexpr int N_WORDS = MAX_CELLS / (sizeof(unsigned long long) * 8);
+       
+        for (int i = 0; i < N_WORDS; ++i) {
+            h ^= std::hash<unsigned long long>{}(data[i]) + 0x9e3779b9 + (h << 6) + (h >> 2);
+        }
+        return h;
+    }
+};
+struct BoxesEqual {
+    bool operator()(const bitset<MAX_CELLS>& a, const bitset<MAX_CELLS>& b) const {
+        return a == b;
+    }
+};
 // --- END OPTIMIZATION ---
 int rows=0, cols=0;
 vector<bool> walls(MAX_CELLS,false), targets(MAX_CELLS,false), fragile(MAX_CELLS,false), dead_zone(MAX_CELLS,false);
+bitset<MAX_CELLS> target_bits;
 vector<pair<int,int>> id_to_rc(MAX_CELLS);
 int dr[4] = {-1,1,0,0}, dc[4] = {0,0,-1,1};
 char dir_char[4] = {'W','S','A','D'}; // up, down, left, right
@@ -40,8 +61,7 @@ inline bool in_bounds_idx(int idx) { return idx >=0 && idx < rows*cols; }
 // is_deadlock_simple is the original corner check
 bool is_deadlock_simple(const State &s) {
     int N = rows*cols;
-    for (int i=0;i<N;++i){
-        if (!s.boxes[i]) continue;
+    for (size_t i = s.boxes._Find_first(); i < MAX_CELLS; i = s.boxes._Find_next(i)) {
         if (targets[i]) continue;
         auto [r,c] = id_to_rc[i];
         auto blocked = [&](int rr,int cc)->bool{
@@ -59,8 +79,7 @@ bool is_deadlock(const State &s) {
     if(is_deadlock_simple(s)) return true;
     int N = rows*cols;
    
-    for(int i=0;i<N;++i){
-        if(!s.boxes[i]) continue;
+    for(size_t i = s.boxes._Find_first(); i < MAX_CELLS; i = s.boxes._Find_next(i)) {
         if(targets[i]) continue;
        
         // Static Dead Zones (original corners + 2x2 precomputed)
@@ -100,7 +119,7 @@ bool is_deadlock(const State &s) {
 // ---------- Player reachability & BFS player path (unchanged) ----------
 bitset<MAX_CELLS> player_reachable(int start, const bitset<MAX_CELLS> &boxes) {
     int N = rows * cols;
-    vector<char> seen(N, 0);
+    bitset<MAX_CELLS> seen; seen.reset();
     queue<int> q;
     seen[start]=1; q.push(start);
     while(!q.empty()){
@@ -114,15 +133,13 @@ bitset<MAX_CELLS> player_reachable(int start, const bitset<MAX_CELLS> &boxes) {
             if(!seen[v]) { seen[v]=1; q.push(v); }
         }
     }
-    bitset<MAX_CELLS> reachable;
-    for (int i = 0; i < N; ++i) if (seen[i]) reachable[i] = 1;
-    return reachable;
+    return seen;
 }
 string bfs_player_path(const State &s,int from_idx,int to_idx){
     if(from_idx==to_idx) return string();
     int N = rows*cols;
     vector<int> prev(N,-1), prev_dir(N,-1);
-    queue<int> q; vector<char> seen(N,0);
+    queue<int> q; bitset<MAX_CELLS> seen; seen.reset();
     q.push(from_idx); seen[from_idx]=1;
     bool found=false;
     while(!q.empty() && !found){
@@ -155,7 +172,9 @@ int heuristic_sum(const State &s){
     int N=rows*cols;
     vector<pair<int,int>> box_positions;
     box_positions.reserve(32);
-    for(int i=0;i<N;++i) if(s.boxes[i]) box_positions.push_back(id_to_rc[i]);
+    for(size_t i = s.boxes._Find_first(); i < MAX_CELLS; i = s.boxes._Find_next(i)) {
+        box_positions.push_back(id_to_rc[i]);
+    }
     int n = box_positions.size();
     if (n == 0) return 0;
     const int MAX_N = 32;
@@ -217,21 +236,10 @@ string reconstruct_full_moves(const unordered_map<State, pair<State, char>, Stat
     for(size_t i=0;i+1<states.size();++i){
         State ps = states[i];
         State cs = states[i+1];
-        int b=-1, t=-1; int N=rows*cols;
-        for(int idx=0;idx<N;++idx){
-            if(ps.boxes[idx] && !cs.boxes[idx]){ b=idx; break; }
-        }
-        for(int idx=0;idx<N;++idx){
-            if(!ps.boxes[idx] && cs.boxes[idx]){ t=idx; break; }
-        }
-        if(b==-1 || t==-1){
-            auto it = parent.find(cs);
-            if(it != parent.end()) {
-                char mv = it->second.second;
-                if(mv) result.push_back(mv);
-            }
-            continue;
-        }
+        bitset<MAX_CELLS> diff = ps.boxes ^ cs.boxes;
+        size_t b = diff._Find_first();
+        size_t t = diff._Find_next(b);
+        if(!ps.boxes[b]) std::swap(b, t);
         auto [br,bc]=id_to_rc[b]; auto [tr,tc]=id_to_rc[t];
         int d=-1;
         for(int dd=0;dd<4;++dd) if(br+dr[dd]==tr && bc+dc[dd]==tc){ d=dd; break; }
@@ -263,7 +271,8 @@ pair<int,string> astar_push_solver(const State &start, int beam_width, long long
     priority_queue<Node> pq;
     unordered_map<State,int,StateHash,StateEqual> best_g;
     unordered_map<State,pair<State,char>,StateHash,StateEqual> parent;
-    int h0=heuristic_sum(start);
+    vector<unordered_map<bitset<MAX_CELLS>, int, BoxesHash, BoxesEqual>> heuristic_caches(omp_get_max_threads());
+    int h0 = heuristic_sum(start);
    
     best_g.reserve(beam_width * 20);
     parent.reserve(beam_width * 20);
@@ -286,7 +295,7 @@ pair<int,string> astar_push_solver(const State &start, int beam_width, long long
         long long raw_generated = 0;
         // Always use deferred pruning for better performance
         vector<vector<pair<Node, pair<State, char>>>> thread_candidates(omp_get_max_threads());
-        #pragma omp parallel for default(none) shared(current_level, N, best_g, thread_candidates, targets, id_to_rc, dr, dc, rows, cols, walls, fragile, dead_zone, dir_char)
+        #pragma omp parallel for default(none) shared(current_level, N, best_g, thread_candidates, targets, id_to_rc, dr, dc, rows, cols, walls, fragile, dead_zone, dir_char, heuristic_caches, target_bits)
         for(size_t i=0; i<current_level.size(); ++i){
             Node cur=current_level[i];
             State s=cur.s; int g=cur.g;
@@ -296,14 +305,12 @@ pair<int,string> astar_push_solver(const State &start, int beam_width, long long
             if(it_g==best_g.end() || it_g->second != g) continue;
            
             // Check for goal state
-            bool done=true;
-            for(int j=0;j<N;++j) if(s.boxes[j] && !targets[j]){ done=false; break; }
+            bool done = (s.boxes & ~target_bits).none();
             if(done) {
                 continue;
             }
             bitset<MAX_CELLS> reach=player_reachable(s.player, s.boxes);
-            for(int b=0;b<N;++b){
-                if(!s.boxes[b]) continue;
+            for(size_t b = s.boxes._Find_first(); b < MAX_CELLS; b = s.boxes._Find_next(b)){
                 auto [br,bc]=id_to_rc[b];
                 for(int d=0;d<4;++d){
                     int pr=br-dr[d], pc=bc-dc[d], tr=br+dr[d], tc=bc+dc[d];
@@ -314,7 +321,17 @@ pair<int,string> astar_push_solver(const State &start, int beam_width, long long
                     if(walls[tidx] || s.boxes[tidx] || fragile[tidx] || dead_zone[tidx]) continue;
                     State ns=s; ns.boxes[b]=0; ns.boxes[tidx]=1; ns.player=b;
                     if(is_deadlock(ns)) continue;
-                    int h=heuristic_sum(ns), ng=g+1;
+                    int ng=g+1;
+                    int h;
+                    auto &local_cache = heuristic_caches[thread_id];
+                    auto hit = local_cache.find(ns.boxes);
+                    if (hit != local_cache.end()) {
+                        h = hit->second;
+                    } else {
+                        int computed_h = heuristic_sum(ns);
+                        h = computed_h;
+                        local_cache[ns.boxes] = h;
+                    }
                    
                     // Collect candidate without checking best_g
                     thread_candidates[thread_id].push_back({Node{ng+h, ng, ns}, {s, dir_char[d]}});
@@ -347,7 +364,7 @@ pair<int,string> astar_push_solver(const State &start, int beam_width, long long
         }
         // Sort and select the beam width (Sequential part with partial_sort)
         size_t select_size = std::min((size_t)beam_width, next_level_candidates.size());
-        std::partial_sort(next_level_candidates.begin(), next_level_candidates.begin() + select_size, next_level_candidates.end(), [](const Node &a, const Node &b){ return a.f < b.f; });
+        __gnu_parallel::partial_sort(next_level_candidates.begin(), next_level_candidates.begin() + select_size, next_level_candidates.end(), [](const Node &a, const Node &b){ return a.f < b.f; });
         next_level_candidates.resize(select_size);
        
         // Add to priority queue for the next iteration (Sequential part)
@@ -355,8 +372,7 @@ pair<int,string> astar_push_solver(const State &start, int beam_width, long long
         // Check the current level for the goal state again (as we skipped immediate returns in the parallel loop)
         for (const auto& cur : current_level) {
             State s = cur.s;
-            bool done = true;
-            for(int j=0; j<N; ++j) if(s.boxes[j] && !targets[j]){ done=false; break; }
+            bool done = (s.boxes & ~target_bits).none();
             if(done) {
                 return {cur.g, reconstruct_full_moves(parent, s)};
             }
@@ -388,11 +404,11 @@ int main(int argc,char** argv){
         }
     }
     int N = rows * cols;
+    for(int i=0;i<N;++i) if(targets[i]) target_bits.set(i);
     // Compute initial valid pushes as proxy for initial_branching
     bitset<MAX_CELLS> reach = player_reachable(start.player, start.boxes);
     long long initial_branching = 0;
-    for(int b = 0; b < N; ++b) {
-        if(!start.boxes[b]) continue;
+    for(size_t b = start.boxes._Find_first(); b < MAX_CELLS; b = start.boxes._Find_next(b)) {
         auto [br, bc] = id_to_rc[b];
         for(int d = 0; d < 4; ++d) {
             int pr = br - dr[d], pc = bc - dc[d], tr = br + dr[d], tc = bc + dc[d];
@@ -466,7 +482,7 @@ int main(int argc,char** argv){
     // --- END ADDED ---
    
     // Try increasing beam widths
-    vector<int> beam_widths = {500, 5000, 30000, 60000, 100000, 200000};
+    vector<int> beam_widths = {500, 5000, 100000, 200000};
     // vector<int> beam_widths = {20000, 50000, 80000, 100000};
     for(int bw : beam_widths){
         auto res=astar_push_solver(start, bw, initial_branching);
