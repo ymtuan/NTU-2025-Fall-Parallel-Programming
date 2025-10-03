@@ -86,15 +86,12 @@ bool is_deadlock(const State &s) {
             int idx = rr * cols + cc;
             return walls[idx] || s.boxes[idx];
         };
-        bool wall_block_h = is_wall_blocked(r, c-1) && is_wall_blocked(r, c+1);
-        if (wall_block_h) {
-            bool blocked_any_v = is_blocked_any(r-1, c) && is_blocked_any(r+1, c);
-            if (blocked_any_v) return true;
+
+        if (is_wall_blocked(r, c-1) && is_wall_blocked(r, c+1)) {
+            if (is_blocked_any(r-1, c) && is_blocked_any(r+1, c)) return true;
         }
-        bool wall_block_v = is_wall_blocked(r-1, c) && is_wall_blocked(r+1, c);
-        if (wall_block_v) {
-            bool blocked_any_h = is_blocked_any(r, c-1) && is_blocked_any(r, c+1);
-            if (blocked_any_h) return true;
+        if (is_wall_blocked(r-1, c) && is_wall_blocked(r+1, c)) {
+            if (is_blocked_any(r, c-1) && is_blocked_any(r, c+1)) return true;
         }
     }
     return false;
@@ -155,13 +152,13 @@ vector<int> manhattan_target_r, manhattan_target_c;
 int heuristic_sum(const State &s){
     int N=rows*cols;
     vector<pair<int,int>> box_positions;
-    box_positions.reserve(32);
+    box_positions.reserve(64);
     for(size_t i = s.boxes._Find_first(); i < MAX_CELLS; i = s.boxes._Find_next(i)) {
         box_positions.push_back(id_to_rc[i]);
     }
     int n = box_positions.size();
     if (n == 0) return 0;
-    const int MAX_N = 32;
+    const int MAX_N = 64;
     int A[MAX_N + 1][MAX_N + 1] = {0};
     for(int i=0; i<n; ++i){
         auto [br, bc] = box_positions[i];
@@ -279,6 +276,14 @@ pair<int,string> astar_push_solver(const State &start, int beam_width){
             pq.pop();
         }
         if(current_level.empty()) break;
+
+        for (const auto& cur : current_level) {
+            State s = cur.s;
+            bool done = (s.boxes & ~target_bits).none();
+            if(done) {
+                return {cur.g, reconstruct_full_moves(parent, s)};
+            }
+        }
 
         long long raw_generated = 0;
 
@@ -423,7 +428,7 @@ int main(int argc,char** argv){
     int N = rows * cols;
     for(int i=0;i<N;++i) if(targets[i]) target_bits.set(i);
 
-    // precompute dead zones (unchanged)
+    // precompute dead zones
     for(int i=0;i<rows*cols;++i){
         if(walls[i] || targets[i]) continue;
         auto [r,c]=id_to_rc[i];
@@ -469,7 +474,7 @@ int main(int argc,char** argv){
     for (int i=0; i<N; ++i) if (!walls[i] && !reachable_from_targets[i]) dead_zone[i] = true;
 
     // beam widths
-    vector<int> beam_widths = {500, 5000, 20000, 100000, 200000};
+    vector<int> beam_widths = {500, 5000, 20000, 100000, 200000, 500000};
     for(int bw : beam_widths){
         auto res = astar_push_solver(start, bw);
         if(res.first >= 0){
@@ -477,6 +482,6 @@ int main(int argc,char** argv){
             return 0;
         }
     }
-    cout << "No solution found by Beam-A*\n";
+    cout << "No solution found\n";
     return 0;
 }
