@@ -1,4 +1,4 @@
-// Compile: g++ -std=c++17 -O3 -march=native -flto -ltbb hw1_tbb.cpp -o hw1
+// Compile: g++ -std=c++17 -O3 -ltbb hw1_tbb.cpp -o hw1
 // Execute: srun -A ACD114118 -n1 -c${threads} ./hw1 ${input}
 
 #include <bits/stdc++.h>
@@ -52,11 +52,11 @@ vector<bool> walls(MAX_CELLS,false), targets(MAX_CELLS,false), fragile(MAX_CELLS
 bitset<MAX_CELLS> target_bits;
 vector<pair<int,int>> id_to_rc(MAX_CELLS);
 int dr[4] = {-1,1,0,0}, dc[4] = {0,0,-1,1};
-char dir_char[4] = {'W','S','A','D'}; // up, down, left, right
+char dir_char[4] = {'W','S','A','D'};
 
 inline bool in_bounds_idx(int idx) { return idx >=0 && idx < rows*cols; }
 
-// ----- Deadlock checks (unchanged) -----
+// Deadlock checks
 bool is_deadlock_simple(const State &s) {
     for (size_t i = s.boxes._Find_first(); i < MAX_CELLS; i = s.boxes._Find_next(i)) {
         if (targets[i]) continue;
@@ -100,7 +100,7 @@ bool is_deadlock(const State &s) {
     return false;
 }
 
-// ----- Reachability & BFS path (unchanged) -----
+// Reachability & BFS path
 bitset<MAX_CELLS> player_reachable(int start, const bitset<MAX_CELLS> &boxes) {
     bitset<MAX_CELLS> seen; seen.reset();
     queue<int> q;
@@ -150,7 +150,7 @@ string bfs_player_path(const State &s,int from_idx,int to_idx){
     return string(steps.begin(), steps.end());
 }
 
-// ----- Heuristic (unchanged) -----
+// Heuristic
 vector<int> manhattan_target_r, manhattan_target_c;
 int heuristic_sum(const State &s){
     int N=rows*cols;
@@ -204,7 +204,7 @@ int heuristic_sum(const State &s){
     return -v[0];
 }
 
-// ----- Reconstruct moves (unchanged) -----
+// Reconstruct moves
 string reconstruct_full_moves(const unordered_map<State, pair<State, char>, StateHash, StateEqual> &parent, const State &goal){
     vector<State> states;
     State cur = goal;
@@ -243,8 +243,8 @@ string reconstruct_full_moves(const unordered_map<State, pair<State, char>, Stat
     return result;
 }
 
-// ----- Beam A* solver (TBB + per-thread bounded heaps + nth_element) -----
-pair<int,string> astar_push_solver(const State &start, int beam_width, long long initial_branching){
+// Beam A* solver (TBB + per-thread bounded heaps + nth_element)
+pair<int,string> astar_push_solver(const State &start, int beam_width){
     int N=rows*cols;
     manhattan_target_r.clear(); manhattan_target_c.clear();
     for(int i=0;i<N;++i) if(targets[i]){ manhattan_target_r.push_back(id_to_rc[i].first); manhattan_target_c.push_back(id_to_rc[i].second); }
@@ -280,7 +280,6 @@ pair<int,string> astar_push_solver(const State &start, int beam_width, long long
         }
         if(current_level.empty()) break;
 
-        long long est_branching = last_raw_per_node > 0 ? last_raw_per_node : initial_branching;
         long long raw_generated = 0;
 
         // Candidate type: pair<Node, pair<parentState, actionChar>>
@@ -363,7 +362,7 @@ pair<int,string> astar_push_solver(const State &start, int beam_width, long long
             auto it = best_g.find(ns);
             if(it == best_g.end() || ng < it->second){
                 best_g[ns] = ng;
-                parent[ns] = cand.second; // parent state and action
+                parent[ns] = cand.second;
                 pruned_next.push_back(n);
             }
         }
@@ -398,7 +397,7 @@ pair<int,string> astar_push_solver(const State &start, int beam_width, long long
     return {-1,""};
 }
 
-// ----- main (unchanged, from your working version) -----
+// main
 int main(int argc,char** argv){
     ios::sync_with_stdio(false); cin.tie(nullptr);
     if(argc<2){ cerr<<"Usage: "<<argv[0]<<" level.txt\n"; return 1; }
@@ -423,25 +422,6 @@ int main(int argc,char** argv){
     }
     int N = rows * cols;
     for(int i=0;i<N;++i) if(targets[i]) target_bits.set(i);
-
-    // initial_branching estimate
-    bitset<MAX_CELLS> reach = player_reachable(start.player, start.boxes);
-    long long initial_branching = 0;
-    for(size_t b = start.boxes._Find_first(); b < MAX_CELLS; b = start.boxes._Find_next(b)) {
-        auto [br, bc] = id_to_rc[b];
-        for(int d = 0; d < 4; ++d) {
-            int pr = br - dr[d], pc = bc - dc[d], tr = br + dr[d], tc = bc + dc[d];
-            if(pr < 0 || pr >= rows || pc < 0 || pc >= cols) continue;
-            if(tr < 0 || tr >= rows || tc < 0 || tc >= cols) continue;
-            int pidx = pr * cols + pc, tidx = tr * cols + tc;
-            if(!reach[pidx]) continue;
-            if(walls[tidx] || start.boxes[tidx] || fragile[tidx] || dead_zone[tidx]) continue;
-            State ns = start; ns.boxes[b] = 0; ns.boxes[tidx] = 1; ns.player = b;
-            if(is_deadlock(ns)) continue;
-            ++initial_branching;
-        }
-    }
-    if(initial_branching == 0) initial_branching = 1;
 
     // precompute dead zones (unchanged)
     for(int i=0;i<rows*cols;++i){
@@ -489,9 +469,9 @@ int main(int argc,char** argv){
     for (int i=0; i<N; ++i) if (!walls[i] && !reachable_from_targets[i]) dead_zone[i] = true;
 
     // beam widths
-    vector<int> beam_widths = {500, 5000, 100000, 200000};
+    vector<int> beam_widths = {500, 5000, 20000, 100000, 200000};
     for(int bw : beam_widths){
-        auto res = astar_push_solver(start, bw, initial_branching);
+        auto res = astar_push_solver(start, bw);
         if(res.first >= 0){
             cout << res.second << "\n";
             return 0;
