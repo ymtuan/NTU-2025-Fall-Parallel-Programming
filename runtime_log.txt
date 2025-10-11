@@ -1,0 +1,36 @@
+SIFT Execution & Validation Log - Sun Oct 12 00:29:46 CST 2025
+Running with: 2 Nodes, 4 Processes, 6 Cores per Process
+==================================================
+--- Test Case 01 ---
+Command: srun -A ACD114118 -N 2 -n 4 -c 6 --time=00:03:00 ./hw2 testcases/01.jpg results/01.jpg results/01.txt
+srun: No partition specified, setting to default partition 'ctest'
+srun:  User b12901069 Account ACD114118 wallet has 103584.1184 remaining.
+srun: job 16937065 queued and waiting for resources
+srun: job 16937065 has been allocated resources
+Execution time: 16724.1 ms
+Found 45730 keypoints.
+
+Validation Result: Wrong
+
+--- Test Case 02 ---
+Command: srun -A ACD114118 -N 2 -n 4 -c 6 --time=00:03:00 ./hw2 testcases/02.jpg results/02.jpg results/02.txt
+srun: No partition specified, setting to default partition 'ctest'
+srun:  User b12901069 Account ACD114118 wallet has 103584.1184 remaining.
+srun: job 16937067 queued and waiting for resources
+srun: job 16937067 has been allocated resources
+Execution time: 44732.9 ms
+Found 14582 keypoints.
+
+Validation Result: Pass
+
+--- Test Case 03 ---
+Command: srun -A ACD114118 -N 2 -n 4 -c 6 --time=00:03:00 ./hw2 testcases/03.jpg results/03.jpg results/03.txt
+srun: No partition specified, setting to default partition 'ctest'
+srun:  User b12901069 Account ACD114118 wallet has 103584.1184 remaining.
+srun: job 16937068 queued and waiting for resources
+srun: job 16937068 has been allocated resources
+Execution time: 44801.4 ms
+Found 59540 keypoints.
+
+Validation Result: Wrong
+

@@ -6,6 +6,8 @@
 #include <array>
 #include <tuple>
 #include <cassert>
+#include <omp.h>
+#include <mpi.h>
 
 #include "sift.hpp"
 #include "image.hpp"
@@ -214,14 +216,17 @@ bool refine_or_discard_keypoint(Keypoint& kp, const std::vector<Image>& octave,
     return kp_is_valid;
 }
 
-std::vector<Keypoint> find_keypoints(const ScaleSpacePyramid& dog_pyramid, float contrast_thresh,
+std::vector<Keypoint> find_keypoints(const ScaleSpacePyramid& dog_pyramid, 
+                                     int start_octave, int end_octave, 
+                                     float contrast_thresh,
                                      float edge_thresh)
 {
     std::vector<Keypoint> keypoints;
-    for (int i = 0; i < dog_pyramid.num_octaves; i++) {
+    for (int i = start_octave; i < end_octave; i++) {
         const std::vector<Image>& octave = dog_pyramid.octaves[i];
         for (int j = 1; j < dog_pyramid.imgs_per_octave-1; j++) {
             const Image& img = octave[j];
+            #pragma omp parallel for collapse(2)
             for (int x = 1; x < img.width-1; x++) {
                 for (int y = 1; y < img.height-1; y++) {
                     if (std::abs(img.get_pixel(x, y, 0)) < 0.8*contrast_thresh) {
@@ -232,6 +237,7 @@ std::vector<Keypoint> find_keypoints(const ScaleSpacePyramid& dog_pyramid, float
                         bool kp_is_valid = refine_or_discard_keypoint(kp, octave, contrast_thresh,
                                                                       edge_thresh);
                         if (kp_is_valid) {
+                            #pragma omp critical
                             keypoints.push_back(kp);
                         }
                     }
@@ -444,7 +450,10 @@ void compute_keypoint_descriptor(Keypoint& kp, float theta,
     hists_to_vec(histograms, kp.descriptor);
 }
 
-std::vector<Keypoint> find_keypoints_and_descriptors(const Image& img, float sigma_min,
+std::vector<Keypoint> find_keypoints_and_descriptors(const Image& img, 
+                                                     int rank, 
+                                                     int size, 
+                                                     float sigma_min,
                                                      int num_octaves, int scales_per_octave, 
                                                      float contrast_thresh, float edge_thresh, 
                                                      float lambda_ori, float lambda_desc)
@@ -452,24 +461,35 @@ std::vector<Keypoint> find_keypoints_and_descriptors(const Image& img, float sig
     assert(img.channels == 1 || img.channels == 3);
 
     const Image& input = img.channels == 1 ? img : rgb_to_grayscale(img);
-    ScaleSpacePyramid gaussian_pyramid = generate_gaussian_pyramid(input, sigma_min, num_octaves,
-                                                                   scales_per_octave);
+    
+    ScaleSpacePyramid gaussian_pyramid = generate_gaussian_pyramid(input, sigma_min, num_octaves, scales_per_octave);
     ScaleSpacePyramid dog_pyramid = generate_dog_pyramid(gaussian_pyramid);
-    std::vector<Keypoint> tmp_kps = find_keypoints(dog_pyramid, contrast_thresh, edge_thresh);
+    
     ScaleSpacePyramid grad_pyramid = generate_gradient_pyramid(gaussian_pyramid);
     
-    std::vector<Keypoint> kps;
-
-    for (Keypoint& kp_tmp : tmp_kps) {
-        std::vector<float> orientations = find_keypoint_orientations(kp_tmp, grad_pyramid,
-                                                                     lambda_ori, lambda_desc);
+    int octaves_per_process = num_octaves / size;
+    int start_octave = rank * octaves_per_process;
+    int end_octave = (rank == size - 1) ? num_octaves : start_octave + octaves_per_process;
+    
+    std::vector<Keypoint> local_tmp_kps = find_keypoints(dog_pyramid, start_octave, end_octave, contrast_thresh, edge_thresh);
+    std::vector<Keypoint> local_kps;
+    local_kps.reserve(local_tmp_kps.size() * 2);
+    
+    #pragma omp parallel for
+    for (int i = 0; i < local_tmp_kps.size(); ++i) {
+        Keypoint& kp_tmp = local_tmp_kps[i];
+        std::vector<float> orientations = find_keypoint_orientations(kp_tmp, grad_pyramid, lambda_ori, lambda_desc);
         for (float theta : orientations) {
-            Keypoint kp = kp_tmp;
+            Keypoint kp = kp_tmp; // Create a new keypoint for each orientation
             compute_keypoint_descriptor(kp, theta, grad_pyramid, lambda_desc);
-            kps.push_back(kp);
+            #pragma omp critical
+            {
+                local_kps.push_back(kp);
+            }
         }
     }
-    return kps;
+    
+    return local_kps;
 }
 
 float euclidean_dist(std::array<uint8_t, 128>& a, std::array<uint8_t, 128>& b)
