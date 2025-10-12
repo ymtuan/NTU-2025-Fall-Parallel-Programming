@@ -3,7 +3,6 @@
 #include <cassert>
 #include <utility>
 #include <vector>
-#include <algorithm>
 #include <omp.h>
 
 #include <immintrin.h>
@@ -251,12 +250,18 @@ Image grayscale_to_rgb(const Image& img)
 }
 
 // helper fucntion for SIMD Gaussian blur, test
+// Convolves a single row with padding and SIMD
 void convolve_row(const float* src_row, float* dest_row, int width, const std::vector<float>& kernel) {
     int kernel_size = kernel.size();
     int center = kernel_size / 2;
 
-    // Allocate padded_row for this call to avoid thread_local issues
-    std::vector<float> padded_row(width + 2 * center);
+    // Use a thread-local buffer for padding to avoid repeated allocations
+    thread_local std::vector<float> padded_row;
+    if (padded_row.size() < width + 2 * center) {
+        padded_row.resize(width + 2 * center);
+    }
+
+    // Create a padded version of the row
     std::copy(src_row, src_row + width, padded_row.begin() + center);
     for (int i = 0; i < center; ++i) {
         padded_row[i] = src_row[0];
@@ -264,7 +269,6 @@ void convolve_row(const float* src_row, float* dest_row, int width, const std::v
     }
 
     int x = 0;
-    // SIMD loop with conservative bound
     for (; x <= width - 8; x += 8) {
         __m256 sum_vec = _mm256_setzero_ps();
         for (int k = 0; k < kernel_size; ++k) {
@@ -275,7 +279,7 @@ void convolve_row(const float* src_row, float* dest_row, int width, const std::v
         _mm256_storeu_ps(dest_row + x, sum_vec);
     }
 
-    // Scalar loop for remaining pixels
+    // Handle remaining pixels scalar-wise
     for (; x < width; ++x) {
         float sum = 0;
         for (int k = 0; k < kernel_size; ++k) {
@@ -285,17 +289,21 @@ void convolve_row(const float* src_row, float* dest_row, int width, const std::v
     }
 }
 
-Image gaussian_blur(const Image& img, float sigma) {
+// separable 2D gaussian blur for 1 channel image
+Image gaussian_blur(const Image& img, float sigma)
+{
     assert(img.channels == 1);
 
     int size = std::ceil(6 * sigma);
-    if (size % 2 == 0) size++;
+    if (size % 2 == 0)
+        size++;
+    
+    int center = size / 2;
+    float sum = 0;
     
     std::vector<float> kernel(size);
-    float sum = 0;
-    int center = size / 2;
     for (int k = -center; k <= center; k++) {
-        float val = std::exp(-(k * k) / (2 * sigma * sigma));
+        float val = std::exp(-(k*k) / (2*sigma*sigma));
         kernel[center + k] = val;
         sum += val;
     }
@@ -305,46 +313,35 @@ Image gaussian_blur(const Image& img, float sigma) {
 
     Image tmp(img.width, img.height, 1);
     Image filtered(img.width, img.height, 1);
-    Image transposed(img.height, img.width, 1);
-
-    // Horizontal convolution
-    if (img.width * img.height > 10000) { // Use OpenMP for large images
-        #pragma omp parallel for
-        for (int y = 0; y < img.height; ++y) {
-            convolve_row(img.data + y * img.width, tmp.data + y * img.width, img.width, kernel);
-        }
-    } else {
-        for (int y = 0; y < img.height; ++y) {
-            convolve_row(img.data + y * img.width, tmp.data + y * img.width, img.width, kernel);
-        }
-    }
     
-    // Transpose
+    Image transposed(img.height, img.width, 1);
+    
+    // horizontal convolution
+    #pragma omp parallel for
+    for (int y = 0; y < img.height; ++y) {
+        convolve_row(img.data + y * img.width, tmp.data + y * img.width, img.width, kernel);
+    }
+
+    #pragma omp parallel for
     for (int y = 0; y < img.height; ++y) {
         for (int x = 0; x < img.width; ++x) {
             transposed.data[x * transposed.width + y] = tmp.data[y * tmp.width + x];
         }
     }
-
-    // Vertical convolution (on transposed image)
-    if (img.width * img.height > 10000) {
-        #pragma omp parallel for
-        for (int y = 0; y < transposed.height; ++y) {
-            convolve_row(transposed.data + y * transposed.width, tmp.data + y * transposed.width, transposed.width, kernel);
-        }
-    } else {
-        for (int y = 0; y < transposed.height; ++y) {
-            convolve_row(transposed.data + y * transposed.width, tmp.data + y * transposed.width, transposed.width, kernel);
-        }
-    }
     
-    // Transpose back
+    // horizontal convolution on the transposed image
+    #pragma omp parallel for
+    for (int y = 0; y < transposed.height; ++y) {
+        convolve_row(transposed.data + y * transposed.width, tmp.data + y * transposed.width, transposed.width, kernel);
+    }
+
+    #pragma omp parallel for
     for (int y = 0; y < filtered.height; ++y) {
         for (int x = 0; x < filtered.width; ++x) {
             filtered.data[y * filtered.width + x] = tmp.data[x * tmp.width + y];
         }
     }
-
+    
     return filtered;
 }
 
