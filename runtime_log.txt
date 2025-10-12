@@ -1,16 +1,91 @@
-SIFT Execution & Validation Log - Sun Oct 12 18:16:59 CST 2025
+SIFT Execution & Validation Log - Sun Oct 12 16:22:09 CST 2025
 Running with: 2 Nodes, 4 Processes, 6 Cores per Process
 ==================================================
 --- Test Case 01 ---
 Command: srun -A ACD114118 -N 2 -n 4 -c 6 --time=00:03:00 ./hw2 testcases/01.jpg results/01.jpg results/01.txt
 srun: No partition specified, setting to default partition 'ctest'
-srun:  User b12901069 Account ACD114118 wallet has 103547.7485 remaining.
-srun: job 16940302 queued and waiting for resources
-srun: job 16940302 has been allocated resources
-srun: Force Terminated job 16940302
-srun: Job step aborted: Waiting up to 32 seconds for job step to finish.
-slurmstepd: error: *** STEP 16940302.0 ON cpn3806 CANCELLED AT 2025-10-12T18:20:49 DUE TO TIME LIMIT ***
-srun: error: cpn3806: tasks 0-1: Terminated
-srun: error: cpn3807: tasks 2-3: Terminated
+srun:  User b12901069 Account ACD114118 wallet has 103561.8746 remaining.
+srun: job 16939783 queued and waiting for resources
+srun: job 16939783 has been allocated resources
+Execution time: 13373.6 ms
+Found 45730 keypoints.
 
-Validation: Skipped because output file was not created.
+Validation Result: Pass
+
+--- Test Case 02 ---
+Command: srun -A ACD114118 -N 2 -n 4 -c 6 --time=00:03:00 ./hw2 testcases/02.jpg results/02.jpg results/02.txt
+srun: No partition specified, setting to default partition 'ctest'
+srun:  User b12901069 Account ACD114118 wallet has 103561.8746 remaining.
+srun: job 16939787 queued and waiting for resources
+srun: job 16939787 has been allocated resources
+Execution time: 34500.6 ms
+Found 14582 keypoints.
+
+Validation Result: Pass
+
+--- Test Case 03 ---
+Command: srun -A ACD114118 -N 2 -n 4 -c 6 --time=00:03:00 ./hw2 testcases/03.jpg results/03.jpg results/03.txt
+srun: No partition specified, setting to default partition 'ctest'
+srun:  User b12901069 Account ACD114118 wallet has 103561.8746 remaining.
+srun: job 16939790 queued and waiting for resources
+srun: job 16939790 has been allocated resources
+Execution time: 34087.1 ms
+Found 59540 keypoints.
+
+Validation Result: Pass
+
+--- Test Case 04 ---
+Command: srun -A ACD114118 -N 2 -n 4 -c 6 --time=00:03:00 ./hw2 testcases/04.jpg results/04.jpg results/04.txt
+srun: No partition specified, setting to default partition 'ctest'
+srun:  User b12901069 Account ACD114118 wallet has 103561.8746 remaining.
+srun: job 16939795 queued and waiting for resources
+srun: job 16939795 has been allocated resources
+Execution time: 55915 ms
+Found 14067 keypoints.
+
+Validation Result: Pass
+
+--- Test Case 05 ---
+Command: srun -A ACD114118 -N 2 -n 4 -c 6 --time=00:03:00 ./hw2 testcases/05.jpg results/05.jpg results/05.txt
+srun: No partition specified, setting to default partition 'ctest'
+srun:  User b12901069 Account ACD114118 wallet has 103561.8746 remaining.
+srun: job 16939802 queued and waiting for resources
+srun: job 16939802 has been allocated resources
+Execution time: 72476.7 ms
+Found 36880 keypoints.
+
+Validation Result: Pass
+
+--- Test Case 06 ---
+Command: srun -A ACD114118 -N 2 -n 4 -c 6 --time=00:03:00 ./hw2 testcases/06.jpg results/06.jpg results/06.txt
+srun: No partition specified, setting to default partition 'ctest'
+srun:  User b12901069 Account ACD114118 wallet has 103561.8746 remaining.
+srun: job 16939822 queued and waiting for resources
+srun: job 16939822 has been allocated resources
+Execution time: 45801 ms
+Found 164448 keypoints.
+
+Validation Result: Pass
+
+--- Test Case 07 ---
+Command: srun -A ACD114118 -N 2 -n 4 -c 6 --time=00:03:00 ./hw2 testcases/07.jpg results/07.jpg results/07.txt
+srun: No partition specified, setting to default partition 'ctest'
+srun:  User b12901069 Account ACD114118 wallet has 103561.8746 remaining.
+srun: job 16939829 queued and waiting for resources
+srun: job 16939829 has been allocated resources
+Execution time: 79606 ms
+Found 152450 keypoints.
+
+Validation Result: Pass
+
+--- Test Case 08 ---
+Command: srun -A ACD114118 -N 2 -n 4 -c 6 --time=00:03:00 ./hw2 testcases/08.jpg results/08.jpg results/08.txt
+srun: No partition specified, setting to default partition 'ctest'
+srun:  User b12901069 Account ACD114118 wallet has 103561.8746 remaining.
+srun: job 16939840 queued and waiting for resources
+srun: job 16939840 has been allocated resources
+Execution time: 53139 ms
+Found 195056 keypoints.
+
+Validation Result: Pass
+
