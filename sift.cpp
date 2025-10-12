@@ -217,7 +217,7 @@ bool refine_or_discard_keypoint(Keypoint& kp, const std::vector<Image>& octave,
 }
 
 std::vector<Keypoint> find_keypoints(const ScaleSpacePyramid& dog_pyramid, 
-                                     int start_octave, int end_octave, 
+                                     int rank, int size,  
                                      float contrast_thresh,
                                      float edge_thresh)
 {
@@ -232,8 +232,10 @@ std::vector<Keypoint> find_keypoints(const ScaleSpacePyramid& dog_pyramid,
         }
         
         #pragma omp for collapse(2) schedule(dynamic)
-        for (int i = start_octave; i < end_octave; i++) {
+        for (int i = 0; i < dog_pyramid.num_octaves; i++) {
             for (int j = 1; j < dog_pyramid.imgs_per_octave-1; j++) {
+                if (i % size != rank) continue;
+                
                 const std::vector<Image>& octave = dog_pyramid.octaves[i];
                 const Image& img = octave[j];
                 for (int x = 1; x < img.width-1; x++) {
@@ -481,11 +483,7 @@ std::vector<Keypoint> find_keypoints_and_descriptors(const Image& img,
     
     ScaleSpacePyramid grad_pyramid = generate_gradient_pyramid(gaussian_pyramid);
     
-    int octaves_per_process = num_octaves / size;
-    int start_octave = rank * octaves_per_process;
-    int end_octave = (rank == size - 1) ? num_octaves : start_octave + octaves_per_process;
-    
-    std::vector<Keypoint> local_tmp_kps = find_keypoints(dog_pyramid, start_octave, end_octave, contrast_thresh, edge_thresh);
+    std::vector<Keypoint> local_tmp_kps = find_keypoints(dog_pyramid, rank, size, contrast_thresh, edge_thresh);
     std::vector<Keypoint> local_kps;
     local_kps.reserve(local_tmp_kps.size() * 2);
     
