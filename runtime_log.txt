@@ -1,23 +1,91 @@
-SIFT Execution & Validation Log - Sun Oct 12 12:51:26 CST 2025
+SIFT Execution & Validation Log - Sun Oct 12 14:07:12 CST 2025
 Running with: 2 Nodes, 4 Processes, 6 Cores per Process
 ==================================================
+--- Test Case 01 ---
+Command: srun -A ACD114118 -N 2 -n 4 -c 6 --time=00:03:00 ./hw2 testcases/01.jpg results/01.jpg results/01.txt
+srun: No partition specified, setting to default partition 'ctest'
+srun:  User b12901069 Account ACD114118 wallet has 103568.2398 remaining.
+srun: job 16939094 queued and waiting for resources
+srun: job 16939094 has been allocated resources
+Execution time: 16923.9 ms
+Found 45730 keypoints.
+
+Validation Result: Pass
+
+--- Test Case 02 ---
+Command: srun -A ACD114118 -N 2 -n 4 -c 6 --time=00:03:00 ./hw2 testcases/02.jpg results/02.jpg results/02.txt
+srun: No partition specified, setting to default partition 'ctest'
+srun:  User b12901069 Account ACD114118 wallet has 103568.2398 remaining.
+srun: job 16939097 queued and waiting for resources
+srun: job 16939097 has been allocated resources
+Execution time: 33499.7 ms
+Found 14582 keypoints.
+
+Validation Result: Pass
+
+--- Test Case 03 ---
+Command: srun -A ACD114118 -N 2 -n 4 -c 6 --time=00:03:00 ./hw2 testcases/03.jpg results/03.jpg results/03.txt
+srun: No partition specified, setting to default partition 'ctest'
+srun:  User b12901069 Account ACD114118 wallet has 103568.2398 remaining.
+srun: job 16939102 queued and waiting for resources
+srun: job 16939102 has been allocated resources
+Execution time: 38637.9 ms
+Found 59540 keypoints.
+
+Validation Result: Pass
+
+--- Test Case 04 ---
+Command: srun -A ACD114118 -N 2 -n 4 -c 6 --time=00:03:00 ./hw2 testcases/04.jpg results/04.jpg results/04.txt
+srun: No partition specified, setting to default partition 'ctest'
+srun:  User b12901069 Account ACD114118 wallet has 103568.2398 remaining.
+srun: job 16939116 queued and waiting for resources
+srun: job 16939116 has been allocated resources
+Execution time: 80519.2 ms
+Found 14067 keypoints.
+
+Validation Result: Pass
+
+--- Test Case 05 ---
+Command: srun -A ACD114118 -N 2 -n 4 -c 6 --time=00:03:00 ./hw2 testcases/05.jpg results/05.jpg results/05.txt
+srun: No partition specified, setting to default partition 'ctest'
+srun:  User b12901069 Account ACD114118 wallet has 103568.2398 remaining.
+srun: job 16939133 queued and waiting for resources
+srun: job 16939133 has been allocated resources
+Execution time: 69710.5 ms
+Found 36880 keypoints.
+
+Validation Result: Pass
+
 --- Test Case 06 ---
 Command: srun -A ACD114118 -N 2 -n 4 -c 6 --time=00:03:00 ./hw2 testcases/06.jpg results/06.jpg results/06.txt
 srun: No partition specified, setting to default partition 'ctest'
 srun:  User b12901069 Account ACD114118 wallet has 103568.2398 remaining.
-srun: job 16938833 queued and waiting for resources
-srun: job 16938833 has been allocated resources
-Execution time: 152585 ms
-Found 28388 keypoints.
+srun: job 16939154 queued and waiting for resources
+srun: job 16939154 has been allocated resources
+Execution time: 43925.5 ms
+Found 164448 keypoints.
 
-Validation Result: Wrong
+Validation Result: Pass
 
 --- Test Case 07 ---
 Command: srun -A ACD114118 -N 2 -n 4 -c 6 --time=00:03:00 ./hw2 testcases/07.jpg results/07.jpg results/07.txt
 srun: No partition specified, setting to default partition 'ctest'
 srun:  User b12901069 Account ACD114118 wallet has 103568.2398 remaining.
-srun: job 16938842 queued and waiting for resources
-srun: job 16938842 has been allocated resources
-Execution time: 168764 ms
-Found 61903 keypoints.
+srun: job 16939161 queued and waiting for resources
+srun: job 16939161 has been allocated resources
+Execution time: 54401 ms
+Found 152450 keypoints.
+
+Validation Result: Pass
+
+--- Test Case 08 ---
+Command: srun -A ACD114118 -N 2 -n 4 -c 6 --time=00:03:00 ./hw2 testcases/08.jpg results/08.jpg results/08.txt
+srun: No partition specified, setting to default partition 'ctest'
+srun:  User b12901069 Account ACD114118 wallet has 103568.2398 remaining.
+srun: job 16939167 queued and waiting for resources
+srun: job 16939167 has been allocated resources
+Execution time: 59294.2 ms
+Found 195056 keypoints.
+
+Validation Result: Pass
 

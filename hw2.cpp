@@ -35,67 +35,54 @@ int main(int argc, char *argv[])
     // auto start = std::chrono::high_resolution_clock::now();
     
     Image img;
+    int img_props[3];
     
     if (world_rank == 0) {
-        Image original_img(input_img);
-        Image gray_img = original_img.channels == 1 ? original_img : rgb_to_grayscale(original_img);
-        
-        float base_sigma = SIGMA_MIN / MIN_PIX_DIST;
-        Image base_img = gray_img.resize(gray_img.width * 2, gray_img.height * 2, Interpolation::BILINEAR);
-        float sigma_diff = std::sqrt(base_sigma * base_sigma - 1.0f);
-        base_img = gaussian_blur(base_img, sigma_diff);
-        
-        std::vector<Image> octave_base_images;
-        octave_base_images.push_back(base_img);
-        for (int i = 1; i < N_OCT; ++i) {
-            const Image& prev_base = octave_base_images.back();
-            octave_base_images.push_back(prev_base.resize(prev_base.width/2, prev_base.height/2, Interpolation::NEAREST));
-        }
-        
-        int octaves_per_process = N_OCT / world_size;
-        for (int i = 1; i < world_size; ++i) {
-            int start_octave = i * octaves_per_process;
-            const Image& octave_base = octave_base_images[start_octave];
-            int props[] = {octave_base.width, octave_base.height, octave_base.channels};
-            MPI_Send(props, 3, MPI_INT, i , 0, MPI_COMM_WORLD);
-            MPI_Send(octave_base.data, octave_base.size, MPI_FLOAT, i , 1, MPI_COMM_WORLD);
-        }
-        img = octave_base_images[0];
+        img = Image(input_img);
+        img_props[0] = img.width;
+        img_props[1] = img.height;
+        img_props[2] = img.channels;
     }
-    else {
-        int props[3];
-        MPI_Recv(props, 3, MPI_INT, 0, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-        img = Image(props[0], props[1], props[2]);
-        MPI_Recv(img.data, img.size, MPI_FLOAT, 0, 1, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+    
+    MPI_Bcast(img_props, 3, MPI_INT, 0, MPI_COMM_WORLD);
+    
+    if (world_rank != 0) {
+        img = Image(img_props[0], img_props[1], img_props[2]);
     }
+    
+    MPI_Bcast(img.data, img.size, MPI_FLOAT, 0, MPI_COMM_WORLD);
     
     MPI_Barrier(MPI_COMM_WORLD);  // Synchronize before starting timer
     auto start = std::chrono::high_resolution_clock::now();
     
 
-    // std::vector<Keypoint> kps = find_keypoints_and_descriptors(img);
-    std::vector<Keypoint> local_kps = find_keypoints_and_descriptors(img, world_rank, world_size);
+    Image gray_img = img.channels == 1 ? img : rgb_to_grayscale(img);
+
+    std::vector<Keypoint> local_kps = find_keypoints_and_descriptors(gray_img, world_rank, world_size);
       
     auto end = std::chrono::high_resolution_clock::now();
     
-    const int ints_per_kp = 4 + (2 * sizeof(float) / sizeof(int)) + 128;
+    // Define packet size: 4 ints + 2 floats (treated as ints) + 128 descriptor ints.
+    const int ints_per_float = sizeof(float) / sizeof(int);
+    const int ints_per_kp = 4 + (2 * ints_per_float) + 128;
     int local_kp_count = local_kps.size();
     
     std::vector<int> local_kps_data(local_kp_count * ints_per_kp);
     for(int i = 0; i < local_kp_count; ++i) {
-       const auto& kp = local_kps[i];
-       int* offset = &local_kps_data[i * ints_per_kp];
-       offset[0] = kp.i;
-       offset[1] = kp.j;
-       offset[2] = kp.octave;
-       offset[3] = kp.scale;
-       
-       std::memcpy(&offset[4], &kp.x, sizeof(float));
-       std::memcpy(&offset[4 + sizeof(float) / sizeof(int)], &kp.y, sizeof(float));
-       
-       for(int j = 0; j < 128; ++j) {
-           offset[4 + 2 * sizeof(float) / sizeof(int) + j] = static_cast<int>(kp.descriptor[j]);
-       }
+         const auto& kp = local_kps[i];
+         int* offset = &local_kps_data[i * ints_per_kp];
+         offset[0] = kp.i;
+         offset[1] = kp.j;
+         offset[2] = kp.octave;
+         offset[3] = kp.scale;
+         
+         // Safely copy float bytes into the integer array for transport.
+         std::memcpy(&offset[4], &kp.x, sizeof(float));
+         std::memcpy(&offset[4 + ints_per_float], &kp.y, sizeof(float));
+  
+         for(int j = 0; j < 128; ++j) {
+             offset[4 + 2 * ints_per_float + j] = static_cast<int>(kp.descriptor[j]);
+         }
     }
     
     std::vector<int> recv_counts(world_size, 0);
@@ -134,10 +121,10 @@ int main(int argc, char *argv[])
             kp.scale = offset[3];
             
             std::memcpy(&kp.x, &offset[4], sizeof(float));
-            std::memcpy(&kp.y, &offset[4 + sizeof(float) / sizeof(int)], sizeof(float));
+            std::memcpy(&kp.y, &offset[4 + ints_per_float], sizeof(float));
             
             for(int j = 0; j < 128; ++j) {
-                kp.descriptor[j] = static_cast<uint8_t>(offset[4 + 2 * sizeof(float) / sizeof(int) + j]);
+                kp.descriptor[j] = static_cast<uint8_t>(offset[4 + 2 * ints_per_float + j]);
             }
             all_kps.push_back(kp);
         }
