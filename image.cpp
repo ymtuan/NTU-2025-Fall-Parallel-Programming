@@ -2,7 +2,10 @@
 #include <iostream>
 #include <cassert>
 #include <utility>
+#include <vector>
 #include <omp.h>
+
+#include <immintrin.h>
 
 #include "image.hpp"
 #define STB_IMAGE_IMPLEMENTATION
@@ -246,6 +249,46 @@ Image grayscale_to_rgb(const Image& img)
     return rgb;
 }
 
+// helper fucntion for SIMD Gaussian blur, test
+// Convolves a single row with padding and SIMD
+void convolve_row(const float* src_row, float* dest_row, int width, const std::vector<float>& kernel) {
+    int kernel_size = kernel.size();
+    int center = kernel_size / 2;
+
+    // Use a thread-local buffer for padding to avoid repeated allocations
+    thread_local std::vector<float> padded_row;
+    if (padded_row.size() < width + 2 * center) {
+        padded_row.resize(width + 2 * center);
+    }
+
+    // Create a padded version of the row
+    std::copy(src_row, src_row + width, padded_row.begin() + center);
+    for (int i = 0; i < center; ++i) {
+        padded_row[i] = src_row[0];
+        padded_row[center + width + i] = src_row[width - 1];
+    }
+
+    int x = 0;
+    for (; x <= width - 8; x += 8) {
+        __m256 sum_vec = _mm256_setzero_ps();
+        for (int k = 0; k < kernel_size; ++k) {
+            __m256 kernel_val = _mm256_set1_ps(kernel[k]);
+            __m256 src_vec = _mm256_loadu_ps(padded_row.data() + x + k);
+            sum_vec = _mm256_fmadd_ps(src_vec, kernel_val, sum_vec);
+        }
+        _mm256_storeu_ps(dest_row + x, sum_vec);
+    }
+
+    // Handle remaining pixels scalar-wise
+    for (; x < width; ++x) {
+        float sum = 0;
+        for (int k = 0; k < kernel_size; ++k) {
+            sum += padded_row[x + k] * kernel[k];
+        }
+        dest_row[x] = sum;
+    }
+}
+
 // separable 2D gaussian blur for 1 channel image
 Image gaussian_blur(const Image& img, float sigma)
 {
@@ -254,44 +297,51 @@ Image gaussian_blur(const Image& img, float sigma)
     int size = std::ceil(6 * sigma);
     if (size % 2 == 0)
         size++;
+    
     int center = size / 2;
-    Image kernel(size, 1, 1);
     float sum = 0;
-    for (int k = -size/2; k <= size/2; k++) {
+    
+    std::vector<float> kernel(size);
+    for (int k = -center; k <= center; k++) {
         float val = std::exp(-(k*k) / (2*sigma*sigma));
-        kernel.set_pixel(center+k, 0, 0, val);
+        kernel[center + k] = val;
         sum += val;
     }
-    for (int k = 0; k < size; k++)
-        kernel.data[k] /= sum;
+    for (int k = 0; k < size; k++) {
+        kernel[k] /= sum;
+    }
 
     Image tmp(img.width, img.height, 1);
     Image filtered(img.width, img.height, 1);
+    
+    Image transposed(img.height, img.width, 1);
+    
+    // horizontal convolution
+    #pragma omp parallel for
+    for (int y = 0; y < img.height; ++y) {
+        convolve_row(img.data + y * img.width, tmp.data + y * img.width, img.width, kernel);
+    }
 
-    // convolve vertical
     #pragma omp parallel for
-    for (int x = 0; x < img.width; x++) {
-        for (int y = 0; y < img.height; y++) {
-            float sum = 0;
-            for (int k = 0; k < size; k++) {
-                int dy = -center + k;
-                sum += img.get_pixel(x, y+dy, 0) * kernel.data[k];
-            }
-            tmp.set_pixel(x, y, 0, sum);
+    for (int y = 0; y < img.height; ++y) {
+        for (int x = 0; x < img.width; ++x) {
+            transposed.data[x * transposed.width + y] = tmp.data[y * tmp.width + x];
         }
     }
-    // convolve horizontal
+    
+    // horizontal convolution on the transposed image
     #pragma omp parallel for
-    for (int x = 0; x < img.width; x++) {
-        for (int y = 0; y < img.height; y++) {
-            float sum = 0;
-            for (int k = 0; k < size; k++) {
-                int dx = -center + k;
-                sum += tmp.get_pixel(x+dx, y, 0) * kernel.data[k];
-            }
-            filtered.set_pixel(x, y, 0, sum);
+    for (int y = 0; y < transposed.height; ++y) {
+        convolve_row(transposed.data + y * transposed.width, tmp.data + y * transposed.width, transposed.width, kernel);
+    }
+
+    #pragma omp parallel for
+    for (int y = 0; y < filtered.height; ++y) {
+        for (int x = 0; x < filtered.width; ++x) {
+            filtered.data[y * filtered.width + x] = tmp.data[x * tmp.width + y];
         }
     }
+    
     return filtered;
 }
 
