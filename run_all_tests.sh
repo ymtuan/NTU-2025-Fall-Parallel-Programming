@@ -56,7 +56,7 @@ echo "Starting tests... (Detailed output will be in $LOG_FILE)"
 echo "--------------------------------------------------------"
 
 # Loop through all 8 test cases.
-for i in {1..3}
+for i in {6..8}
 do
     TEST_CASE=$(printf "%02d" "$i")
 

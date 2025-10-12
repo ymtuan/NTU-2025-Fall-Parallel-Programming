@@ -475,7 +475,7 @@ std::vector<Keypoint> find_keypoints_and_descriptors(const Image& img,
     std::vector<Keypoint> local_kps;
     local_kps.reserve(local_tmp_kps.size() * 2);
     
-    #pragma omp parallel for
+    #pragma omp parallel for schedule(dynamic)
     for (int i = 0; i < local_tmp_kps.size(); ++i) {
         Keypoint& kp_tmp = local_tmp_kps[i];
         std::vector<float> orientations = find_keypoint_orientations(kp_tmp, grad_pyramid, lambda_ori, lambda_desc);
