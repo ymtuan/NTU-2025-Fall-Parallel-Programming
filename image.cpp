@@ -219,6 +219,7 @@ Image rgb_to_grayscale(const Image& img)
 {
     assert(img.channels == 3);
     Image gray(img.width, img.height, 1);
+    // #pragma omp parallel for collapse(2)
     for (int x = 0; x < img.width; x++) {
         for (int y = 0; y < img.height; y++) {
             float red, green, blue;
@@ -235,6 +236,7 @@ Image grayscale_to_rgb(const Image& img)
 {
     assert(img.channels == 1);
     Image rgb(img.width, img.height, 3);
+    // #pragma omp parallel for collapse(2)
     for (int x = 0; x < img.width; x++) {
         for (int y = 0; y < img.height; y++) {
             float gray_val = img.get_pixel(x, y, 0);
