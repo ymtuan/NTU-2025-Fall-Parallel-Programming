@@ -32,7 +32,7 @@ int main(int argc, char *argv[])
     std::string output_img = argv[2];
     std::string output_txt = argv[3];
     
-    auto start = std::chrono::high_resolution_clock::now();
+    // auto start = std::chrono::high_resolution_clock::now();
     
     Image img;
     int img_props[3];
@@ -53,7 +53,8 @@ int main(int argc, char *argv[])
     MPI_Bcast(img.data, img.size, MPI_FLOAT, 0, MPI_COMM_WORLD);
     
     MPI_Barrier(MPI_COMM_WORLD);  // Synchronize before starting timer
-    //  auto start = std::chrono::high_resolution_clock::now();
+    auto start = std::chrono::high_resolution_clock::now();
+    
 
     Image gray_img = img.channels == 1 ? img : rgb_to_grayscale(img);
 

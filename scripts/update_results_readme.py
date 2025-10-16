@@ -1,16 +1,11 @@
 import re
-import subprocess
-from datetime import datetime
 from pathlib import Path
 
-# Paths
-log_path = Path("runtime_log.txt")
+log_path = Path("sift_log.txt")
 readme_path = Path("README.md")
 
-# Read log file
 log_text = log_path.read_text()
 
-# Extract test results
 pattern = re.compile(
     r"--- Test Case (\d+) ---.*?"
     r"Execution time:\s*([\d\.]+)\s*ms.*?"
@@ -19,42 +14,33 @@ pattern = re.compile(
     re.DOTALL
 )
 
-# Get commit hash and timestamp
-commit_hash = subprocess.check_output(["git", "rev-parse", "--short", "HEAD"]).decode().strip()
-timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
-
-# Build rows
 rows = []
 for match in pattern.finditer(log_text):
     case, time, keypoints, result = match.groups()
     emoji = "✅" if result == "Pass" else "❌"
-    rows.append(f"| `{commit_hash}` | {timestamp} | {case} | {time} | {keypoints} | {emoji} {result} |")
+    rows.append(f"| {case} | {time} | {keypoints} | {emoji} {result} |")
 
-# Load README and markers
+table_header = (
+    "| Test Case | Time (ms) | Keypoints | Result |\n"
+    "|-----------|-----------|-----------|--------|\n"
+)
+table = table_header + "\n".join(rows)
+
+# Replace between markers in README
 readme_text = readme_path.read_text()
 start_marker = "<!-- RESULT_TABLE_START -->"
 end_marker = "<!-- RESULT_TABLE_END -->"
 
-if start_marker not in readme_text or end_marker not in readme_text:
-    # Insert a new table if not present
-    table_header = (
-        "| Commit | Date | Test Case | Time (ms) | Keypoints | Result |\n"
-        "|--------|------|-----------|-----------|-----------|--------|\n"
+if start_marker in readme_text and end_marker in readme_text:
+    new_text = re.sub(
+        f"{start_marker}.*?{end_marker}",
+        f"{start_marker}\n{table}\n{end_marker}",
+        readme_text,
+        flags=re.DOTALL
     )
-    new_table = table_header + "\n".join(rows)
-    readme_text += f"\n\n{start_marker}\n{new_table}\n{end_marker}\n"
 else:
-    # Append rows to the existing table
-    parts = readme_text.split(start_marker)
-    head = parts[0]
-    body = parts[1].split(end_marker)
-    table_section = body[0]
-    footer = end_marker + body[1]
+    new_text = readme_text + f"\n\n{start_marker}\n{table}\n{end_marker}\n"
 
-    # Append rows after the header line
-    new_table_section = table_section.strip() + "\n" + "\n".join(rows) + "\n"
-    readme_text = head + start_marker + "\n" + new_table_section + footer
+readme_path.write_text(new_text)
+print("README.md updated with latest test results.")
 
-# Write back
-readme_path.write_text(readme_text)
-print(f"Appended {len(rows)} results to README.md for commit {commit_hash}")
