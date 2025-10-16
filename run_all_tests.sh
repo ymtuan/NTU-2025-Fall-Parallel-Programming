@@ -45,7 +45,6 @@ fi
 
 # Create results directory if it doesn't exist.
 mkdir -p "$RESULTS_DIR"
-rm "$RESULTS_DIR"/*
 
 # --- Script Execution ---
 echo "SIFT Execution & Validation Log - $(date)" > "$LOG_FILE"

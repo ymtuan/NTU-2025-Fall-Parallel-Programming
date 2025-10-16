@@ -69,7 +69,6 @@ ScaleSpacePyramid generate_dog_pyramid(const ScaleSpacePyramid& img_pyramid)
         dog_pyramid.octaves[i].reserve(dog_pyramid.imgs_per_octave);
         for (int j = 1; j < img_pyramid.imgs_per_octave; j++) {
             Image diff = img_pyramid.octaves[i][j];
-            // #pragma omp parallel for
             for (int pix_idx = 0; pix_idx < diff.size; pix_idx++) {
                 diff.data[pix_idx] -= img_pyramid.octaves[i][j-1].data[pix_idx];
             }
@@ -224,9 +223,7 @@ std::vector<Keypoint> find_keypoints(const ScaleSpacePyramid& dog_pyramid,
 {
     std::vector<Keypoint> keypoints;
     std::vector<std::vector<Keypoint>> thread_keypoints;
-
-    omp_set_nested(1);  // Enable nested OpenMP for fine-grained inner parallelism (minimal addition)
-
+    
     #pragma omp parallel
     {
         #pragma omp single
@@ -234,47 +231,28 @@ std::vector<Keypoint> find_keypoints(const ScaleSpacePyramid& dog_pyramid,
             thread_keypoints.resize(omp_get_num_threads());
         }
         
-        #pragma omp for collapse(2) schedule(dynamic)  // Keep original outer OpenMP
+        #pragma omp for collapse(2) schedule(dynamic)
         for (int i = 0; i < dog_pyramid.num_octaves; i++) {
             for (int j = 1; j < dog_pyramid.imgs_per_octave-1; j++) {
-                // Remove: if (i % size != rank) continue;  // Replace coarse octave skip with fine row division below
-
+                if (i % size != rank) continue;
+                
                 const std::vector<Image>& octave = dog_pyramid.octaves[i];
                 const Image& img = octave[j];
-                int w = img.width;
-                int h = img.height;
-
-                // New: Fine-grained MPI division - compute row chunk per rank for this scale (balances across sizes)
-                int num_rows = h - 2;  // Processable rows (1 to h-2)
-                int chunk_size = (num_rows + size - 1) / size;  // Ceiling division for balance
-                int y_start = 1 + rank * chunk_size;
-                int y_end = std::min(y_start + chunk_size, h - 1);
-                if (y_start >= y_end) continue;  // Skip if no rows for this rank
-
-                // New: Local collector for this scale to avoid races across nested teams
-                std::vector<Keypoint> task_keypoints;
-
-                // Modified: Inner nested parallel for fine-grained pixel parallelism
-                #pragma omp parallel for collapse(2) schedule(dynamic)
-                for (int y = y_start; y < y_end; y++) {
-                    for (int x = 1; x < w - 1; x++) {
+                for (int x = 1; x < img.width-1; x++) {
+                    for (int y = 1; y < img.height-1; y++) {
                         if (std::abs(img.get_pixel(x, y, 0)) < 0.8 * contrast_thresh) {
                             continue;
                         }
                         if (point_is_extremum(octave, j, x, y)) {
                             Keypoint kp = {x, y, i, j, -1, -1, -1, -1};
-                            bool kp_is_valid = refine_or_discard_keypoint(kp, octave, contrast_thresh, edge_thresh);
+                            bool kp_is_valid = refine_or_discard_keypoint(kp, octave, contrast_thresh,
+                                                                          edge_thresh);
                             if (kp_is_valid) {
-                                #pragma omp critical  // Synchronize pushes to local vector
-                                task_keypoints.push_back(kp);
+                                thread_keypoints[omp_get_thread_num()].push_back(kp);
                             }
                         }
                     }
                 }
-
-                // New: After inner parallel, add to outer thread's collector (no critical needed, as per-task)
-                thread_keypoints[omp_get_thread_num()].insert(thread_keypoints[omp_get_thread_num()].end(),
-                                                              task_keypoints.begin(), task_keypoints.end());
             }
         }
     }
