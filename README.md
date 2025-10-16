@@ -6,7 +6,7 @@
 <!-- RESULT_TABLE_START -->
 | Test Case | Time (ms) | Keypoints | Result |
 |-----------|-----------|-----------|--------|
-| 05 | 24007.4 | 36871 | ✅ Pass |
-| 06 | 27030.5 | 164448 | ✅ Pass |
+| 05 | 29275.8 | 36871 | ✅ Pass |
+| 06 | 26576.6 | 164448 | ✅ Pass |
 <!-- RESULT_TABLE_END -->
 

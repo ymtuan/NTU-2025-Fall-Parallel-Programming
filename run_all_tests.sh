@@ -15,7 +15,7 @@ ACCOUNT="ACD114118"
 NODES=2
 PROCS=4
 CORES=6
-TIME_LIMIT="00:03:00"
+TIME_LIMIT="00:00:45"
 
 # --- Log File & Directories ---
 LOG_FILE="runtime_log.txt"

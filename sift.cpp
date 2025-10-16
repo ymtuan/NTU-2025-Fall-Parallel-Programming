@@ -59,8 +59,27 @@ ScaleSpacePyramid generate_gaussian_pyramid(const Image& img, float sigma_min,
 }
 
 // generate pyramid of difference of gaussians (DoG) images
-ScaleSpacePyramid generate_dog_pyramid(const ScaleSpacePyramid& img_pyramid)
-{
+//ScaleSpacePyramid generate_dog_pyramid(const ScaleSpacePyramid& img_pyramid)
+//{
+//    ScaleSpacePyramid dog_pyramid = {
+//        img_pyramid.num_octaves,
+//        img_pyramid.imgs_per_octave - 1,
+//        std::vector<std::vector<Image>>(img_pyramid.num_octaves)
+//    };
+//    for (int i = 0; i < dog_pyramid.num_octaves; i++) {
+//        dog_pyramid.octaves[i].reserve(dog_pyramid.imgs_per_octave);
+//        for (int j = 1; j < img_pyramid.imgs_per_octave; j++) {
+//            Image diff = img_pyramid.octaves[i][j];
+//            #pragma omp parallel for schedule(static)
+//            for (int pix_idx = 0; pix_idx < diff.size; pix_idx++) {
+//                diff.data[pix_idx] -= img_pyramid.octaves[i][j-1].data[pix_idx];
+//            }
+//            dog_pyramid.octaves[i].push_back(diff);
+//        }
+//    }
+//    return dog_pyramid;
+//}
+ScaleSpacePyramid generate_dog_pyramid(const ScaleSpacePyramid& img_pyramid) {
     ScaleSpacePyramid dog_pyramid = {
         img_pyramid.num_octaves,
         img_pyramid.imgs_per_octave - 1,
@@ -69,42 +88,18 @@ ScaleSpacePyramid generate_dog_pyramid(const ScaleSpacePyramid& img_pyramid)
     for (int i = 0; i < dog_pyramid.num_octaves; i++) {
         dog_pyramid.octaves[i].reserve(dog_pyramid.imgs_per_octave);
         for (int j = 1; j < img_pyramid.imgs_per_octave; j++) {
-            Image diff = img_pyramid.octaves[i][j];
+            const Image& curr = img_pyramid.octaves[i][j];
+            const Image& prev = img_pyramid.octaves[i][j - 1];
+            Image diff(curr.width, curr.height, 1);
             #pragma omp parallel for schedule(static)
             for (int pix_idx = 0; pix_idx < diff.size; pix_idx++) {
-                diff.data[pix_idx] -= img_pyramid.octaves[i][j-1].data[pix_idx];
+                diff.data[pix_idx] = curr.data[pix_idx] - prev.data[pix_idx];
             }
             dog_pyramid.octaves[i].push_back(diff);
         }
     }
     return dog_pyramid;
 }
-//ScaleSpacePyramid generate_dog_pyramid(const ScaleSpacePyramid& img_pyramid) {
-//    ScaleSpacePyramid dog_pyramid = { /* ... */ };
-//    for (int i = 0; i < dog_pyramid.num_octaves; i++) {
-//        dog_pyramid.octaves[i].reserve(dog_pyramid.imgs_per_octave);
-//        for (int j = 1; j < img_pyramid.imgs_per_octave; j++) {
-//            const Image& curr = img_pyramid.octaves[i][j];
-//            const Image& prev = img_pyramid.octaves[i][j - 1];
-//            Image diff(curr.width, curr.height, 1);
-//            #pragma omp parallel for schedule(static)
-//            for (int pix_idx = 0; pix_idx < diff.size; pix_idx += 8) {  // Chunk for OpenMP
-//                int remaining = diff.size - pix_idx;
-//                if (remaining >= 8) {
-//                    __m256 curr_vec = _mm256_loadu_ps(&curr.data[pix_idx]);
-//                    __m256 prev_vec = _mm256_loadu_ps(&prev.data[pix_idx]);
-//                    __m256 diff_vec = _mm256_sub_ps(curr_vec, prev_vec);
-//                    _mm256_storeu_ps(&diff.data[pix_idx], diff_vec);
-//                } else {
-//                    for (int r = 0; r < remaining; r++) {
-//                        diff.data[pix_idx + r] = curr.data[pix_idx + r] - prev.data[pix_idx + r];
-//                    }
-//                }
-//            }
-//        }
-//    }
-//    return dog_pyramid;
-//}
 
 bool point_is_extremum(const std::vector<Image>& octave, int scale, int x, int y)
 {
