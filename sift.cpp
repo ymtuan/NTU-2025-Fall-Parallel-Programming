@@ -8,6 +8,7 @@
 #include <cassert>
 #include <omp.h>
 #include <mpi.h>
+#include <immintrin.h>
 
 #include "sift.hpp"
 #include "image.hpp"
@@ -69,6 +70,7 @@ ScaleSpacePyramid generate_dog_pyramid(const ScaleSpacePyramid& img_pyramid)
         dog_pyramid.octaves[i].reserve(dog_pyramid.imgs_per_octave);
         for (int j = 1; j < img_pyramid.imgs_per_octave; j++) {
             Image diff = img_pyramid.octaves[i][j];
+            #pragma omp parallel for schedule(static)
             for (int pix_idx = 0; pix_idx < diff.size; pix_idx++) {
                 diff.data[pix_idx] -= img_pyramid.octaves[i][j-1].data[pix_idx];
             }
@@ -276,13 +278,14 @@ ScaleSpacePyramid generate_gradient_pyramid(const ScaleSpacePyramid& pyramid)
         int height = pyramid.octaves[i][0].height;
         for (int j = 0; j < pyramid.imgs_per_octave; j++) {
             Image grad(width, height, 2);
-            float gx, gy;
-            for (int x = 1; x < grad.width-1; x++) {
-                for (int y = 1; y < grad.height-1; y++) {
-                    gx = (pyramid.octaves[i][j].get_pixel(x+1, y, 0)
+            // float gx, gy;
+            #pragma omp parallel for schedule(static)
+            for (int y = 1; y < grad.height-1; y++) {
+              for (int x = 1; x < grad.width-1; x++) {
+                    float gx = (pyramid.octaves[i][j].get_pixel(x+1, y, 0)
                          -pyramid.octaves[i][j].get_pixel(x-1, y, 0)) * 0.5;
                     grad.set_pixel(x, y, 0, gx);
-                    gy = (pyramid.octaves[i][j].get_pixel(x, y+1, 0)
+                    float gy = (pyramid.octaves[i][j].get_pixel(x, y+1, 0)
                          -pyramid.octaves[i][j].get_pixel(x, y-1, 0)) * 0.5;
                     grad.set_pixel(x, y, 1, gy);
                 }
@@ -464,31 +467,83 @@ void compute_keypoint_descriptor(Keypoint& kp, float theta,
     hists_to_vec(histograms, kp.descriptor);
 }
 
-std::vector<Keypoint> find_keypoints_and_descriptors(const Image& img, 
-                                                     int rank, 
-                                                     int size, 
+#include <chrono> // Make sure to include the chrono library for timing
+#include <mpi.h>  // For MPI_Barrier
+
+// ... other includes and functions ...
+
+std::vector<Keypoint> find_keypoints_and_descriptors(const Image& img,
+                                                     int rank,
+                                                     int size,
                                                      float sigma_min,
-                                                     int num_octaves, int scales_per_octave, 
-                                                     float contrast_thresh, float edge_thresh, 
+                                                     int num_octaves, int scales_per_octave,
+                                                     float contrast_thresh, float edge_thresh,
                                                      float lambda_ori, float lambda_desc)
 {
     assert(img.channels == 1 || img.channels == 3);
 
+    // --- Timing Setup ---
+    auto start_total = std::chrono::high_resolution_clock::now();
+    auto start_step = start_total;
+    auto end_step = start_total;
+
+    // --- Grayscale Conversion ---
     const Image& input = img.channels == 1 ? img : rgb_to_grayscale(img);
-    
+    MPI_Barrier(MPI_COMM_WORLD); // Synchronize all processes
+    end_step = std::chrono::high_resolution_clock::now();
+    if (rank == 0) {
+        std::chrono::duration<double, std::milli> duration = end_step - start_step;
+        std::cout << "  [TIMING] Grayscale conversion: " << duration.count() << " ms\n";
+    }
+
+    // --- Gaussian Pyramid ---
+    start_step = std::chrono::high_resolution_clock::now();
     ScaleSpacePyramid gaussian_pyramid = generate_gaussian_pyramid(input, sigma_min, num_octaves, scales_per_octave);
+    MPI_Barrier(MPI_COMM_WORLD);
+    end_step = std::chrono::high_resolution_clock::now();
+    if (rank == 0) {
+        std::chrono::duration<double, std::milli> duration = end_step - start_step;
+        std::cout << "  [TIMING] Gaussian pyramid generation: " << duration.count() << " ms\n";
+    }
+
+    // --- Difference of Gaussians (DoG) Pyramid ---
+    start_step = std::chrono::high_resolution_clock::now();
     ScaleSpacePyramid dog_pyramid = generate_dog_pyramid(gaussian_pyramid);
-    
+    MPI_Barrier(MPI_COMM_WORLD);
+    end_step = std::chrono::high_resolution_clock::now();
+    if (rank == 0) {
+        std::chrono::duration<double, std::milli> duration = end_step - start_step;
+        std::cout << "  [TIMING] DoG pyramid generation: " << duration.count() << " ms\n";
+    }
+
+    // --- Gradient Pyramid ---
+    start_step = std::chrono::high_resolution_clock::now();
     ScaleSpacePyramid grad_pyramid = generate_gradient_pyramid(gaussian_pyramid);
-    
+    MPI_Barrier(MPI_COMM_WORLD);
+    end_step = std::chrono::high_resolution_clock::now();
+    if (rank == 0) {
+        std::chrono::duration<double, std::milli> duration = end_step - start_step;
+        std::cout << "  [TIMING] Gradient pyramid generation: " << duration.count() << " ms\n";
+    }
+
+    // --- Keypoint Detection ---
+    start_step = std::chrono::high_resolution_clock::now();
     int octaves_per_process = num_octaves / size;
     int start_octave = rank * octaves_per_process;
     int end_octave = (rank == size - 1) ? num_octaves : start_octave + octaves_per_process;
-    
     std::vector<Keypoint> local_tmp_kps = find_keypoints(dog_pyramid, start_octave, end_octave, contrast_thresh, edge_thresh);
+    MPI_Barrier(MPI_COMM_WORLD);
+    end_step = std::chrono::high_resolution_clock::now();
+    if (rank == 0) {
+        std::chrono::duration<double, std::milli> duration = end_step - start_step;
+        std::cout << "  [TIMING] Keypoint detection: " << duration.count() << " ms\n";
+    }
+
+    // --- Orientation and Descriptor Generation ---
+    start_step = std::chrono::high_resolution_clock::now();
     std::vector<Keypoint> local_kps;
     local_kps.reserve(local_tmp_kps.size() * 2);
-    
+
     std::vector<std::vector<Keypoint>> thread_local_kps;
 
     #pragma omp parallel
@@ -509,11 +564,17 @@ std::vector<Keypoint> find_keypoints_and_descriptors(const Image& img,
             }
         }
     }
-    
+
     for (const auto& vec : thread_local_kps) {
         local_kps.insert(local_kps.end(), vec.begin(), vec.end());
     }
-    
+    MPI_Barrier(MPI_COMM_WORLD);
+    end_step = std::chrono::high_resolution_clock::now();
+    if (rank == 0) {
+        std::chrono::duration<double, std::milli> duration = end_step - start_step;
+        std::cout << "  [TIMING] Orientation and descriptor generation: " << duration.count() << " ms\n";
+    }
+
     return local_kps;
 }
 

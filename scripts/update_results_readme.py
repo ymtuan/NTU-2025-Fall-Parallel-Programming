@@ -1,7 +1,7 @@
 import re
 from pathlib import Path
 
-log_path = Path("sift_log.txt")
+log_path = Path("runtime_log.txt")
 readme_path = Path("README.md")
 
 log_text = log_path.read_text()

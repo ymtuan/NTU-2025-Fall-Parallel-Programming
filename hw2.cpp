@@ -32,7 +32,7 @@ int main(int argc, char *argv[])
     std::string output_img = argv[2];
     std::string output_txt = argv[3];
     
-    // auto start = std::chrono::high_resolution_clock::now();
+    auto start = std::chrono::high_resolution_clock::now();
     
     Image img;
     int img_props[3];
@@ -52,15 +52,11 @@ int main(int argc, char *argv[])
     
     MPI_Bcast(img.data, img.size, MPI_FLOAT, 0, MPI_COMM_WORLD);
     
-    MPI_Barrier(MPI_COMM_WORLD);  // Synchronize before starting timer
-    auto start = std::chrono::high_resolution_clock::now();
-    
 
     Image gray_img = img.channels == 1 ? img : rgb_to_grayscale(img);
 
     std::vector<Keypoint> local_kps = find_keypoints_and_descriptors(gray_img, world_rank, world_size);
       
-    auto end = std::chrono::high_resolution_clock::now();
     
     // Define packet size: 4 ints + 2 floats (treated as ints) + 128 descriptor ints.
     const int ints_per_float = sizeof(float) / sizeof(int);
@@ -150,6 +146,8 @@ int main(int argc, char *argv[])
         result.save(output_img);
         // Image result = draw_keypoints(img, all_kps);
         // result.save(output_img);
+        
+        auto end = std::chrono::high_resolution_clock::now();
         
         std::chrono::duration<double, std::milli> duration = end - start;
         std::cout << "Execution time: " << duration.count() << " ms\n";

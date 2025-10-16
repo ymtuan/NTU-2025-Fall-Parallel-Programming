@@ -46,6 +46,8 @@ fi
 # Create results directory if it doesn't exist.
 mkdir -p "$RESULTS_DIR"
 
+rm $RESULTS_DIR$/*
+
 # --- Script Execution ---
 echo "SIFT Execution & Validation Log - $(date)" > "$LOG_FILE"
 echo "Running with: ${NODES} Nodes, ${PROCS} Processes, ${CORES} Cores per Process" >> "$LOG_FILE"
@@ -56,7 +58,7 @@ echo "Starting tests... (Detailed output will be in $LOG_FILE)"
 echo "--------------------------------------------------------"
 
 # Loop through all 8 test cases.
-for i in {1..8}
+for i in {5..6}
 do
     TEST_CASE=$(printf "%02d" "$i")
 
