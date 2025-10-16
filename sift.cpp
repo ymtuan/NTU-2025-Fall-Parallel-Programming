@@ -6,6 +6,7 @@
 #include <array>
 #include <tuple>
 #include <cassert>
+#include <chrono>
 #include <omp.h>
 #include <mpi.h>
 #include <immintrin.h>
@@ -532,10 +533,222 @@ void compute_keypoint_descriptor(Keypoint& kp, float theta,
     hists_to_vec(histograms, kp.descriptor);
 }
 
-#include <chrono> // Make sure to include the chrono library for timing
-#include <mpi.h>  // For MPI_Barrier
 
-// ... other includes and functions ...
+
+// ---------------------------------------------------
+
+struct OctaveAssignment {
+    int start_octave;
+    int end_octave;
+    long long total_work;
+};
+
+struct LoadBalanceAssignment {
+    std::vector<int> start_octaves;  // start_octaves[rank] = starting octave
+    std::vector<int> end_octaves;    // end_octaves[rank] = ending octave (exclusive)
+};
+
+// Compute work units (pixels) for a specific octave
+long long compute_octave_work(int octave_idx, int base_width, int base_height, 
+                              int scales_per_octave)
+{
+    // Each octave is 1/4 the size of previous (half width, half height)
+    long long width = base_width >> octave_idx;   // Equivalent to / 2^octave_idx
+    long long height = base_height >> octave_idx;
+    return width * height * scales_per_octave;
+}
+
+LoadBalanceAssignment compute_load_balance(int world_size, 
+                                           int num_octaves, 
+                                           int img_width, int img_height,
+                                           int scales_per_octave)
+{
+    // Step 1: Calculate work for each octave
+    std::vector<long long> octave_work(num_octaves);
+    long long total_work = 0;
+    
+    for (int i = 0; i < num_octaves; i++) {
+        octave_work[i] = compute_octave_work(i, img_width, img_height, scales_per_octave);
+        total_work += octave_work[i];
+    }
+    
+    // Step 2: Use greedy algorithm to assign octaves to processes
+    std::vector<long long> process_work(world_size, 0);
+    std::vector<int> octave_to_process(num_octaves);
+    
+    for (int octave = 0; octave < num_octaves; octave++) {
+        // Find process with minimum current work
+        int min_process = 0;
+        long long min_work = process_work[0];
+        
+        for (int p = 1; p < world_size; p++) {
+            if (process_work[p] < min_work) {
+                min_work = process_work[p];
+                min_process = p;
+            }
+        }
+        
+        // Assign this octave to least-loaded process
+        octave_to_process[octave] = min_process;
+        process_work[min_process] += octave_work[octave];
+    }
+    
+    // Step 3: Convert to contiguous ranges for each process
+    LoadBalanceAssignment assignment;
+    assignment.start_octaves.resize(world_size);
+    assignment.end_octaves.resize(world_size);
+    
+    std::vector<int> first_octave(world_size, num_octaves);  // Initialize to "none"
+    std::vector<int> last_octave(world_size, -1);            // Initialize to "none"
+    
+    for (int octave = 0; octave < num_octaves; octave++) {
+        int proc = octave_to_process[octave];
+        if (octave < first_octave[proc]) {
+            first_octave[proc] = octave;
+        }
+        if (octave > last_octave[proc]) {
+            last_octave[proc] = octave;
+        }
+    }
+    
+    for (int p = 0; p < world_size; p++) {
+        if (first_octave[p] == num_octaves) {
+            // This process got no octaves
+            assignment.start_octaves[p] = 0;
+            assignment.end_octaves[p] = 0;
+        } else {
+            assignment.start_octaves[p] = first_octave[p];
+            assignment.end_octaves[p] = last_octave[p] + 1;
+        }
+    }
+    
+    return assignment;
+}
+
+OctaveAssignment compute_octave_assignment(int rank, int world_size, 
+                                           int num_octaves, 
+                                           int img_width, int img_height,
+                                           int scales_per_octave)
+{
+    // Step 1: Calculate work for each octave
+    long long total_work = 0;
+    std::vector<long long> octave_work(num_octaves);
+    
+    for (int i = 0; i < num_octaves; i++) {
+        octave_work[i] = compute_octave_work(i, img_width, img_height, scales_per_octave);
+        total_work += octave_work[i];
+    }
+    
+    // Step 2: Precompute all process assignments
+    std::vector<std::pair<int, int>> process_ranges(world_size, {-1, -1});
+    long long work_per_process = total_work / world_size;
+    long long current_work = 0;
+    int current_process = 0;
+    int start_octave = 0;
+    
+    for (int octave = 0; octave < num_octaves; octave++) {
+        current_work += octave_work[octave];
+        
+        // For non-last processes: move to next if work exceeds target AND we're not at the last octave
+        // For last process: gets all remaining octaves
+        bool move_to_next = false;
+        
+        if (current_process < world_size - 1) {
+            // If we exceed target work, move to next process
+            if (current_work > work_per_process && octave < num_octaves - 1) {
+                move_to_next = true;
+            }
+        }
+        
+        if (move_to_next) {
+            process_ranges[current_process] = {start_octave, octave};
+            current_process++;
+            start_octave = octave;
+            current_work = octave_work[octave];
+        }
+        
+        // Last octave: assign remaining octaves to current process
+        if (octave == num_octaves - 1) {
+            process_ranges[current_process] = {start_octave, octave + 1};
+        }
+    }
+    
+    // Step 3: Return assignment for this rank
+    OctaveAssignment assignment;
+    assignment.start_octave = 0;
+    assignment.end_octave = 0;
+    assignment.total_work = 0;
+    
+    if (rank < world_size && process_ranges[rank].first != -1) {
+        assignment.start_octave = process_ranges[rank].first;
+        assignment.end_octave = process_ranges[rank].second;
+        
+        // Calculate total work for this process
+        for (int i = assignment.start_octave; i < assignment.end_octave; i++) {
+            assignment.total_work += octave_work[i];
+        }
+    }
+    
+    return assignment;
+}
+
+OctaveAssignment compute_octave_assignment_greedy(int rank, int world_size, 
+                                                   int num_octaves, 
+                                                   int img_width, int img_height,
+                                                   int scales_per_octave)
+{
+    // Step 1: Calculate work for each octave
+    std::vector<long long> octave_work(num_octaves);
+    long long total_work = 0;
+    
+    for (int i = 0; i < num_octaves; i++) {
+        octave_work[i] = compute_octave_work(i, img_width, img_height, scales_per_octave);
+        total_work += octave_work[i];
+    }
+    
+    // Step 2: Assign each octave to the process with least work (greedy)
+    std::vector<long long> process_work(world_size, 0);
+    std::vector<int> octave_to_process(num_octaves);
+    
+    for (int octave = 0; octave < num_octaves; octave++) {
+        // Find process with minimum current work
+        int min_process = 0;
+        long long min_work = process_work[0];
+        
+        for (int p = 1; p < world_size; p++) {
+            if (process_work[p] < min_work) {
+                min_work = process_work[p];
+                min_process = p;
+            }
+        }
+        
+        // Assign this octave to least-loaded process
+        octave_to_process[octave] = min_process;
+        process_work[min_process] += octave_work[octave];
+    }
+    
+    // Step 3: Find start and end for this rank
+    OctaveAssignment assignment;
+    assignment.start_octave = num_octaves;  // Default: no octaves
+    assignment.end_octave = num_octaves;
+    assignment.total_work = 0;
+    
+    for (int octave = 0; octave < num_octaves; octave++) {
+        if (octave_to_process[octave] == rank) {
+            if (octave < assignment.start_octave) {
+                assignment.start_octave = octave;
+            }
+            if (octave >= assignment.end_octave) {
+                assignment.end_octave = octave + 1;
+            }
+            assignment.total_work += octave_work[octave];
+        }
+    }
+    
+    return assignment;
+}
+
+// -----------------------------------------------
 
 std::vector<Keypoint> find_keypoints_and_descriptors(const Image& img,
                                                      int rank,
@@ -545,6 +758,7 @@ std::vector<Keypoint> find_keypoints_and_descriptors(const Image& img,
                                                      float contrast_thresh, float edge_thresh,
                                                      float lambda_ori, float lambda_desc)
 {
+    
     assert(img.channels == 1 || img.channels == 3);
 
     // --- Timing Setup ---
@@ -592,10 +806,38 @@ std::vector<Keypoint> find_keypoints_and_descriptors(const Image& img,
     }
 
     // --- Keypoint Detection ---
+    LoadBalanceAssignment load_assignment;
+    
+    if (rank == 0) {
+        load_assignment = compute_load_balance(size, num_octaves, 
+                                               input.width, input.height, 
+                                               scales_per_octave);
+        
+        // Debug output
+        std::cout << "[DEBUG] Load balancing info:\n";
+        for (int r = 0; r < size; r++) {
+            std::cout << "  Process " << r << ": octaves [" 
+                      << load_assignment.start_octaves[r] << ", " 
+                      << load_assignment.end_octaves[r] << ")\n";
+        }
+    }
+    
+    // Broadcast start_octaves array
+    std::vector<int> start_octaves_bcast(size);
+    std::vector<int> end_octaves_bcast(size);
+    
+    if (rank == 0) {
+        start_octaves_bcast = load_assignment.start_octaves;
+        end_octaves_bcast = load_assignment.end_octaves;
+    }
+    
+    MPI_Bcast(start_octaves_bcast.data(), size, MPI_INT, 0, MPI_COMM_WORLD);
+    MPI_Bcast(end_octaves_bcast.data(), size, MPI_INT, 0, MPI_COMM_WORLD);
+    
+    int start_octave = start_octaves_bcast[rank];
+    int end_octave = end_octaves_bcast[rank];
+        
     start_step = std::chrono::high_resolution_clock::now();
-    int octaves_per_process = num_octaves / size;
-    int start_octave = rank * octaves_per_process;
-    int end_octave = (rank == size - 1) ? num_octaves : start_octave + octaves_per_process;
     std::vector<Keypoint> local_tmp_kps = find_keypoints(dog_pyramid, start_octave, end_octave, contrast_thresh, edge_thresh);
     MPI_Barrier(MPI_COMM_WORLD);
     end_step = std::chrono::high_resolution_clock::now();
@@ -603,6 +845,8 @@ std::vector<Keypoint> find_keypoints_and_descriptors(const Image& img,
         std::chrono::duration<double, std::milli> duration = end_step - start_step;
         std::cout << "  [TIMING] Keypoint detection: " << duration.count() << " ms\n";
     }
+    
+    // -------------------------
 
     // --- Orientation and Descriptor Generation ---
     start_step = std::chrono::high_resolution_clock::now();

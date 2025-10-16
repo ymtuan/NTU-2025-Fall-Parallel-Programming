@@ -54,6 +54,7 @@ int main(int argc, char *argv[])
     
 
     Image gray_img = img.channels == 1 ? img : rgb_to_grayscale(img);
+    
 
     std::vector<Keypoint> local_kps = find_keypoints_and_descriptors(gray_img, world_rank, world_size);
       
