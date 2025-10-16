@@ -2,6 +2,8 @@
 
 hw2
 
+.tmp/
+
 *.o
 
 testcases/*.jpg
