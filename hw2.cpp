@@ -52,13 +52,14 @@ int main(int argc, char *argv[])
     
     MPI_Bcast(img.data, img.size, MPI_FLOAT, 0, MPI_COMM_WORLD);
     
+    MPI_Barrier(MPI_COMM_WORLD);  // Synchronize before starting timer
+    //  auto start = std::chrono::high_resolution_clock::now();
+
     Image gray_img = img.channels == 1 ? img : rgb_to_grayscale(img);
-    
-    auto t1 = std::chrono::high_resolution_clock::now();
 
     std::vector<Keypoint> local_kps = find_keypoints_and_descriptors(gray_img, world_rank, world_size);
-    
-    auto t2 = std::chrono::high_resolution_clock::now();
+      
+    auto end = std::chrono::high_resolution_clock::now();
     
     // Define packet size: 4 ints + 2 floats (treated as ints) + 128 descriptor ints.
     const int ints_per_float = sizeof(float) / sizeof(int);
@@ -83,12 +84,8 @@ int main(int argc, char *argv[])
          }
     }
     
-    auto t3 = std::chrono::high_resolution_clock::now();
-    
     std::vector<int> recv_counts(world_size, 0);
     MPI_Gather(&local_kp_count, 1, MPI_INT, recv_counts.data(), 1, MPI_INT, 0, MPI_COMM_WORLD);
-    
-    auto t4 = std::chrono::high_resolution_clock::now();
     
     if (world_rank == 0) {
         // Calculate total keypoints and displacements for MPI_Gatherv
@@ -150,23 +147,12 @@ int main(int argc, char *argv[])
         Image original_img(input_img);
         Image result = draw_keypoints(original_img, all_kps);
         result.save(output_img);
-        
-        auto end = std::chrono::high_resolution_clock::now();
+        // Image result = draw_keypoints(img, all_kps);
+        // result.save(output_img);
         
         std::chrono::duration<double, std::milli> duration = end - start;
         std::cout << "Execution time: " << duration.count() << " ms\n";
         std::cout << "Found " << all_kps.size() << " keypoints.\n";
-        
-        duration = t1 - start;
-        std::cout << "t1 - start: " << duration.count() << "ms\n";
-        duration = t2 - t1;
-        std::cout << "t2 - t1: " << duration.count() << "ms\n";
-        duration = t3 - t2;
-        std::cout << "t3 - t2: " << duration.count() << "ms\n";
-        duration = t4 - t3;
-        std::cout << "t4 - t3: " << duration.count() << "ms\n";
-        duration = end - t4;
-        std::cout << "end - t4: " << duration.count() << "ms\n";
     } else {
         // Non-root processes send their data
         MPI_Gatherv(local_kps_data.data(), local_kps_data.size(), MPI_INT,
