@@ -91,9 +91,23 @@ ScaleSpacePyramid generate_dog_pyramid(const ScaleSpacePyramid& img_pyramid) {
             const Image& curr = img_pyramid.octaves[i][j];
             const Image& prev = img_pyramid.octaves[i][j - 1];
             Image diff(curr.width, curr.height, 1);
+            int vec_size = 8;  // AVX2: 8 floats
             #pragma omp parallel for schedule(static)
-            for (int pix_idx = 0; pix_idx < diff.size; pix_idx++) {
-                diff.data[pix_idx] = curr.data[pix_idx] - prev.data[pix_idx];
+            for (int row = 0; row < diff.height; row++) {  // Parallel over rows for better cache
+                const float* curr_row = &curr.data[row * curr.width];
+                const float* prev_row = &prev.data[row * prev.width];
+                float* diff_row = &diff.data[row * diff.width];
+                int x = 0;
+                for (; x <= diff.width - vec_size; x += vec_size) {
+                    __m256 curr_vec = _mm256_loadu_ps(curr_row + x);  // Unaligned load
+                    __m256 prev_vec = _mm256_loadu_ps(prev_row + x);
+                    __m256 diff_vec = _mm256_sub_ps(curr_vec, prev_vec);
+                    _mm256_storeu_ps(diff_row + x, diff_vec);
+                }
+                // Scalar remainder (safe bounds)
+                for (; x < diff.width; x++) {
+                    diff_row[x] = curr_row[x] - prev_row[x];
+                }
             }
             dog_pyramid.octaves[i].push_back(diff);
         }
@@ -387,6 +401,7 @@ std::vector<float> find_keypoint_orientations(Keypoint& kp,
     int y_end = std::round((kp.y + patch_radius)/pix_dist);
 
     // accumulate gradients in orientation histogram
+    #pragma omp parallel for schedule(static) reduction(+:hist[0:N_BINS])
     for (int x = x_start; x <= x_end; x++) {
         for (int y = y_start; y <= y_end; y++) {
             gx = img_grad.get_pixel(x, y, 0);

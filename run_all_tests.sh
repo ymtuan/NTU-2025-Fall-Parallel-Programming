@@ -44,9 +44,11 @@ if [ ! -d "$GOLDENS_DIR" ]; then
 fi
 
 # Create results directory if it doesn't exist.
-mkdir -p "$RESULTS_DIR"
+if [ -d "$RESULTS_DIR" ]; then
+    rm -f ${RESULTS_DIR:?}/*
+fi
 
-rm $RESULTS_DIR$/*
+mkdir -p "$RESULTS_DIR"
 
 # --- Script Execution ---
 echo "SIFT Execution & Validation Log - $(date)" > "$LOG_FILE"
@@ -58,7 +60,7 @@ echo "Starting tests... (Detailed output will be in $LOG_FILE)"
 echo "--------------------------------------------------------"
 
 # Loop through all 8 test cases.
-for i in {5..6}
+for i in {5..8}
 do
     TEST_CASE=$(printf "%02d" "$i")
 

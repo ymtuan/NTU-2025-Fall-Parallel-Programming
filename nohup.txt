@@ -1,0 +1,22 @@
+nohup: ignoring input
+Looking for hw2.cpp: [32mOK[0m
+Looking for image.cpp: [32mOK[0m
+Looking for image.hpp: [32mOK[0m
+Looking for sift.cpp: [32mOK[0m
+Looking for sift.hpp: [32mOK[0m
+Looking for stb_image.h: [32mOK[0m
+Looking for stb_image_write.h: [32mOK[0m
+Looking for Makefile: [32mOK[0m
+Running: /usr/bin/make -C /home/b12901069/.judge.2132988257 hw2
+make: Entering directory '/home/b12901069/.judge.2132988257'
+mpicxx -std=c++17 -O3 -fopenmp -mavx2 -mfma -march=native -I. -c hw2.cpp
+mpicxx -std=c++17 -O3 -fopenmp -mavx2 -mfma -march=native -I. -c sift.cpp
+mpicxx -std=c++17 -O3 -fopenmp -mavx2 -mfma -march=native -I. -c image.cpp
+mpicxx -std=c++17 -O3 -fopenmp -mavx2 -mfma -march=native -o hw2 hw2.o sift.o image.o
+make: Leaving directory '/home/b12901069/.judge.2132988257'
+2   17.09   [32maccepted[0m
+4   26.31   [32maccepted[0m
+6   27.11   [32maccepted[0m
+8   33.41   [32maccepted[0m
+Removing temporary directory /home/b12901069/.judge.2132988257
+Scoreboard: not updating {4 99.41} -x-> {4 103.92}
