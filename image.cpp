@@ -3,6 +3,7 @@
 #include <cassert>
 #include <utility>
 #include <omp.h>
+#include <immintrin.h>
 
 #include "image.hpp"
 #define STB_IMAGE_IMPLEMENTATION
@@ -267,6 +268,57 @@ Image grayscale_to_rgb(const Image& img)
 }
 
 // separable 2D gaussian blur for 1 channel image
+//Image gaussian_blur(const Image& img, float sigma)
+//{
+//    assert(img.channels == 1);
+//
+//    int size = std::ceil(6 * sigma);
+//    if (size % 2 == 0)
+//        size++;
+//    int center = size / 2;
+//    Image kernel(size, 1, 1);
+//    float sum = 0;
+//    for (int k = -size/2; k <= size/2; k++) {
+//        float val = std::exp(-(k*k) / (2*sigma*sigma));
+//        kernel.set_pixel(center+k, 0, 0, val);
+//        sum += val;
+//    }
+//    for (int k = 0; k < size; k++)
+//        kernel.data[k] /= sum;
+//
+//    Image tmp(img.width, img.height, 1);
+//    Image filtered(img.width, img.height, 1);
+//
+//    // convolve vertical
+//    //#pragma omp parallel for schedule(static, 8)
+//    #pragma omp parallel for schedule(guided) collapse(1) num_threads(omp_get_max_threads())
+//    for (int y = 0; y < img.height; y++) {
+//        for (int x = 0; x < img.width; x++) {
+//            float sum = 0;
+//            #pragma omp simd
+//            for (int k = 0; k < size; k++) {
+//                int dy = -center + k;
+//                sum += img.get_pixel(x, y+dy, 0) * kernel.data[k];
+//            }
+//            tmp.set_pixel(x, y, 0, sum);
+//        }
+//    }
+//    // convolve horizontal
+//    //#pragma omp parallel for schedule(static, 8)
+//    #pragma omp parallel for schedule(guided) collapse(1) num_threads(omp_get_max_threads())
+//    for (int y = 0; y < img.height; y++) {
+//        for (int x = 0; x < img.width; x++) {
+//            float sum = 0;
+//            #pragma omp simd
+//            for (int k = 0; k < size; k++) {
+//                int dx = -center + k;
+//                sum += tmp.get_pixel(x+dx, y, 0) * kernel.data[k];
+//            }
+//            filtered.set_pixel(x, y, 0, sum);
+//        }
+//    }
+//    return filtered;
+//}
 Image gaussian_blur(const Image& img, float sigma)
 {
     assert(img.channels == 1);
@@ -275,6 +327,7 @@ Image gaussian_blur(const Image& img, float sigma)
     if (size % 2 == 0)
         size++;
     int center = size / 2;
+    
     Image kernel(size, 1, 1);
     float sum = 0;
     for (int k = -size/2; k <= size/2; k++) {
@@ -288,36 +341,93 @@ Image gaussian_blur(const Image& img, float sigma)
     Image tmp(img.width, img.height, 1);
     Image filtered(img.width, img.height, 1);
 
-    // convolve vertical
-    //#pragma omp parallel for schedule(static, 8)
+    // VERTICAL PASS with SIMD
     #pragma omp parallel for schedule(guided)
     for (int y = 0; y < img.height; y++) {
-        for (int x = 0; x < img.width; x++) {
-            float sum = 0;
-            #pragma omp simd
+        float* tmp_row = tmp.data + y * img.width;
+        
+        int x = 0;
+        int vec_size = 8;  // AVX2
+        
+        // Vectorized loop
+        for (; x <= img.width - vec_size; x += vec_size) {
+            __m256 sum_vec = _mm256_setzero_ps();
+            
             for (int k = 0; k < size; k++) {
-                int dy = -center + k;
-                sum += img.get_pixel(x, y+dy, 0) * kernel.data[k];
+                int iy = y + (-center + k);
+                if (iy < 0) iy = 0;
+                if (iy >= img.height) iy = img.height - 1;
+                
+                __m256 vals = _mm256_loadu_ps(&img.data[iy * img.width + x]);
+                __m256 kern = _mm256_set1_ps(kernel.data[k]);
+                sum_vec = _mm256_fmadd_ps(vals, kern, sum_vec);
             }
-            tmp.set_pixel(x, y, 0, sum);
+            
+            _mm256_storeu_ps(tmp_row + x, sum_vec);
+        }
+        
+        // Scalar remainder
+        for (; x < img.width; x++) {
+            float sum = 0;
+            for (int k = 0; k < size; k++) {
+                int iy = y + (-center + k);
+                if (iy < 0) iy = 0;
+                if (iy >= img.height) iy = img.height - 1;
+                sum += img.data[iy * img.width + x] * kernel.data[k];
+            }
+            tmp_row[x] = sum;
         }
     }
-    // convolve horizontal
-    //#pragma omp parallel for schedule(static, 8)
+
+    // HORIZONTAL PASS with SIMD (similar structure)
     #pragma omp parallel for schedule(guided)
     for (int y = 0; y < img.height; y++) {
-        for (int x = 0; x < img.width; x++) {
-            float sum = 0;
-            #pragma omp simd
+        float* filt_row = filtered.data + y * img.width;
+        
+        int x = 0;
+        int vec_size = 8;
+        
+        for (; x <= img.width - vec_size; x += vec_size) {
+            __m256 sum_vec = _mm256_setzero_ps();
+            
             for (int k = 0; k < size; k++) {
-                int dx = -center + k;
-                sum += tmp.get_pixel(x+dx, y, 0) * kernel.data[k];
+                int ix_base = x + (-center + k);
+                
+                // Load 8 consecutive values with boundary handling
+                __m256 vals = _mm256_setr_ps(
+                    tmp.data[y * img.width + std::max(0, std::min(img.width-1, ix_base+0))],
+                    tmp.data[y * img.width + std::max(0, std::min(img.width-1, ix_base+1))],
+                    tmp.data[y * img.width + std::max(0, std::min(img.width-1, ix_base+2))],
+                    tmp.data[y * img.width + std::max(0, std::min(img.width-1, ix_base+3))],
+                    tmp.data[y * img.width + std::max(0, std::min(img.width-1, ix_base+4))],
+                    tmp.data[y * img.width + std::max(0, std::min(img.width-1, ix_base+5))],
+                    tmp.data[y * img.width + std::max(0, std::min(img.width-1, ix_base+6))],
+                    tmp.data[y * img.width + std::max(0, std::min(img.width-1, ix_base+7))]
+                );
+                
+                __m256 kern = _mm256_set1_ps(kernel.data[k]);
+                sum_vec = _mm256_fmadd_ps(vals, kern, sum_vec);
             }
-            filtered.set_pixel(x, y, 0, sum);
+            
+            _mm256_storeu_ps(filt_row + x, sum_vec);
+        }
+        
+        // Scalar remainder
+        for (; x < img.width; x++) {
+            float sum = 0;
+            for (int k = 0; k < size; k++) {
+                int ix = x + (-center + k);
+                if (ix < 0) ix = 0;
+                if (ix >= img.width) ix = img.width - 1;
+                sum += tmp.data[y * img.width + ix] * kernel.data[k];
+            }
+            filt_row[x] = sum;
         }
     }
+    
     return filtered;
 }
+
 
 void draw_point(Image& img, int x, int y, int size)
 {
