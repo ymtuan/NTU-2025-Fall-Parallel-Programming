@@ -1,7 +1,7 @@
 # Makefile for hw2_sift project
 # Compiler and flags
 MPICXX = mpicxx
-MPIFLAGS = -std=c++17 -O3 -fopenmp
+MPIFLAGS = -std=c++17 -O3 -fopenmp -mavx2 -march=native
 INCLUDES = -I.
 
 # Source files

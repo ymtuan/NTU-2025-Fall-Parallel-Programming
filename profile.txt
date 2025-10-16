@@ -1,0 +1,37 @@
+SIFT Execution & Validation Log - Thu Oct 16 15:07:00 CST 2025
+Running with: 2 Nodes, 4 Processes, 6 Cores per Process
+==================================================
+--- Test Case 01 ---
+Command: srun -A ACD114118 -N 2 -n 4 -c 6 --time=00:03:00 ./hw2 testcases/01.jpg results/01.jpg results/01.txt
+srun: No partition specified, setting to default partition 'ctest'
+srun:  User b12901069 Account ACD114118 wallet has 103196.2772 remaining.
+srun: job 16995749 queued and waiting for resources
+srun: job 16995749 has been allocated resources
+  [TIMING] Grayscale conversion: 8.50263 ms
+  [TIMING] Gaussian pyramid generation: 3599.35 ms
+  [TIMING] DoG pyramid generation: 839.794 ms
+  [TIMING] Gradient pyramid generation: 5562.34 ms
+  [TIMING] Keypoint detection: 511.594 ms
+  [TIMING] Orientation and descriptor generation: 1666.65 ms
+Execution time: 13653 ms
+Found 45730 keypoints.
+
+Validation Result: Pass
+
+--- Test Case 02 ---
+Command: srun -A ACD114118 -N 2 -n 4 -c 6 --time=00:03:00 ./hw2 testcases/02.jpg results/02.jpg results/02.txt
+srun: No partition specified, setting to default partition 'ctest'
+srun:  User b12901069 Account ACD114118 wallet has 103185.4766 remaining.
+srun: job 16995767 queued and waiting for resources
+srun: job 16995767 has been allocated resources
+  [TIMING] Grayscale conversion: 25.4265 ms
+  [TIMING] Gaussian pyramid generation: 8922.26 ms
+  [TIMING] DoG pyramid generation: 2419.16 ms
+  [TIMING] Gradient pyramid generation: 15998.1 ms
+  [TIMING] Keypoint detection: 532.182 ms
+  [TIMING] Orientation and descriptor generation: 644.176 ms
+Execution time: 31669.9 ms
+Found 14582 keypoints.
+
+Validation Result: Pass
+
