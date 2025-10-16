@@ -273,6 +273,7 @@ Image gaussian_blur(const Image& img, float sigma)
     for (int y = 0; y < img.height; y++) {
         for (int x = 0; x < img.width; x++) {
             float sum = 0;
+            #pragma omp simd
             for (int k = 0; k < size; k++) {
                 int dy = -center + k;
                 sum += img.get_pixel(x, y+dy, 0) * kernel.data[k];
@@ -285,6 +286,7 @@ Image gaussian_blur(const Image& img, float sigma)
     for (int y = 0; y < img.height; y++) {
         for (int x = 0; x < img.width; x++) {
             float sum = 0;
+            #pragma omp simd
             for (int k = 0; k < size; k++) {
                 int dx = -center + k;
                 sum += tmp.get_pixel(x+dx, y, 0) * kernel.data[k];

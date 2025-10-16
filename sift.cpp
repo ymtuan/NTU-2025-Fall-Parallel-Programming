@@ -79,6 +79,32 @@ ScaleSpacePyramid generate_dog_pyramid(const ScaleSpacePyramid& img_pyramid)
     }
     return dog_pyramid;
 }
+//ScaleSpacePyramid generate_dog_pyramid(const ScaleSpacePyramid& img_pyramid) {
+//    ScaleSpacePyramid dog_pyramid = { /* ... */ };
+//    for (int i = 0; i < dog_pyramid.num_octaves; i++) {
+//        dog_pyramid.octaves[i].reserve(dog_pyramid.imgs_per_octave);
+//        for (int j = 1; j < img_pyramid.imgs_per_octave; j++) {
+//            const Image& curr = img_pyramid.octaves[i][j];
+//            const Image& prev = img_pyramid.octaves[i][j - 1];
+//            Image diff(curr.width, curr.height, 1);
+//            #pragma omp parallel for schedule(static)
+//            for (int pix_idx = 0; pix_idx < diff.size; pix_idx += 8) {  // Chunk for OpenMP
+//                int remaining = diff.size - pix_idx;
+//                if (remaining >= 8) {
+//                    __m256 curr_vec = _mm256_loadu_ps(&curr.data[pix_idx]);
+//                    __m256 prev_vec = _mm256_loadu_ps(&prev.data[pix_idx]);
+//                    __m256 diff_vec = _mm256_sub_ps(curr_vec, prev_vec);
+//                    _mm256_storeu_ps(&diff.data[pix_idx], diff_vec);
+//                } else {
+//                    for (int r = 0; r < remaining; r++) {
+//                        diff.data[pix_idx + r] = curr.data[pix_idx + r] - prev.data[pix_idx + r];
+//                    }
+//                }
+//            }
+//        }
+//    }
+//    return dog_pyramid;
+//}
 
 bool point_is_extremum(const std::vector<Image>& octave, int scale, int x, int y)
 {
@@ -278,18 +304,47 @@ ScaleSpacePyramid generate_gradient_pyramid(const ScaleSpacePyramid& pyramid)
         int height = pyramid.octaves[i][0].height;
         for (int j = 0; j < pyramid.imgs_per_octave; j++) {
             Image grad(width, height, 2);
-            // float gx, gy;
+//            #pragma omp parallel for schedule(static)
+//            for (int y = 1; y < grad.height-1; y++) {
+//              for (int x = 1; x < grad.width-1; x++) {
+//                    float gx = (pyramid.octaves[i][j].get_pixel(x+1, y, 0)
+//                         -pyramid.octaves[i][j].get_pixel(x-1, y, 0)) * 0.5;
+//                    grad.set_pixel(x, y, 0, gx);
+//                    float gy = (pyramid.octaves[i][j].get_pixel(x, y+1, 0)
+//                         -pyramid.octaves[i][j].get_pixel(x, y-1, 0)) * 0.5;
+//                    grad.set_pixel(x, y, 1, gy);
+//                }
+//            }
             #pragma omp parallel for schedule(static)
-            for (int y = 1; y < grad.height-1; y++) {
-              for (int x = 1; x < grad.width-1; x++) {
-                    float gx = (pyramid.octaves[i][j].get_pixel(x+1, y, 0)
-                         -pyramid.octaves[i][j].get_pixel(x-1, y, 0)) * 0.5;
-                    grad.set_pixel(x, y, 0, gx);
-                    float gy = (pyramid.octaves[i][j].get_pixel(x, y+1, 0)
-                         -pyramid.octaves[i][j].get_pixel(x, y-1, 0)) * 0.5;
-                    grad.set_pixel(x, y, 1, gy);
+            for (int y = 1; y < grad.height - 1; y++) {
+                const float* row_m1 = &pyramid.octaves[i][j].data[(y - 1) * width];
+                const float* row = &pyramid.octaves[i][j].data[y * width];
+                const float* row_p1 = &pyramid.octaves[i][j].data[(y + 1) * width];
+                float* gx_row = &grad.data[y * width];      // ch0 starts at 0
+                float* gy_row = &grad.data[grad.size / 2 + y * width];  // ch1 at size/2
+            
+                __m256 half = _mm256_set1_ps(0.5f);
+                int vec_size = 8;
+                for (int x = 1; x < grad.width - 1 - vec_size + 1; x += vec_size) {
+                    __m256 left = _mm256_loadu_ps(&row[x - 1]);
+                    __m256 right = _mm256_loadu_ps(&row[x + 1]);
+                    __m256 gx_vec = _mm256_mul_ps(_mm256_sub_ps(right, left), half);
+                    _mm256_storeu_ps(&gx_row[x], gx_vec);
+            
+                    __m256 up = _mm256_loadu_ps(&row_m1[x]);
+                    __m256 down = _mm256_loadu_ps(&row_p1[x]);
+                    __m256 gy_vec = _mm256_mul_ps(_mm256_sub_ps(down, up), half);
+                    _mm256_storeu_ps(&gy_row[x], gy_vec);
+                }
+                // Scalar remainder
+                for (int x = ((grad.width - 2) / vec_size) * vec_size + 1; x < grad.width - 1; x++) {
+                    float gx = (row[x + 1] - row[x - 1]) * 0.5f;
+                    gx_row[x] = gx;
+                    float gy = (row_p1[x] - row_m1[x]) * 0.5f;
+                    gy_row[x] = gy;
                 }
             }
+                        
             grad_pyramid.octaves[i].push_back(grad);
         }
     }
