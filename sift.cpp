@@ -124,7 +124,7 @@ ScaleSpacePyramid generate_dog_pyramid_fused(const Image& input_img,
                                              int num_octaves,
                                              int scales_per_octave)
 {
-    // Step 1: Pre-compute ALL sigma values for the entire pyramid
+
     float base_sigma = sigma_min / MIN_PIX_DIST;
     Image base_img = input_img.resize(input_img.width*2, input_img.height*2, Interpolation::BILINEAR);
     float sigma_diff = std::sqrt(base_sigma*base_sigma - 1.0f);
@@ -140,7 +140,6 @@ ScaleSpacePyramid generate_dog_pyramid_fused(const Image& input_img,
         sigma_vals.push_back(std::sqrt(sigma_total*sigma_total - sigma_prev*sigma_prev));
     }
     
-    // Step 2: Build DoG pyramid directly (fused blur + subtract)
     ScaleSpacePyramid dog_pyramid = {
         num_octaves,
         imgs_per_octave - 1,
@@ -153,10 +152,8 @@ ScaleSpacePyramid generate_dog_pyramid_fused(const Image& input_img,
         dog_pyramid.octaves[octave].reserve(imgs_per_octave - 1);
         
         for (int scale = 1; scale < imgs_per_octave; scale++) {
-            // FUSED OPERATION: Blur + Subtract in single pass
             Image curr_gaussian = gaussian_blur(prev_gaussian, sigma_vals[scale]);
             
-            // Compute DoG directly while curr_gaussian is hot in cache
             Image dog(curr_gaussian.width, curr_gaussian.height, 1);
             
             int width = curr_gaussian.width;
@@ -171,7 +168,7 @@ ScaleSpacePyramid generate_dog_pyramid_fused(const Image& input_img,
             }
             
             dog_pyramid.octaves[octave].push_back(dog);
-            prev_gaussian = std::move(curr_gaussian);  // Move semantics: no copy
+            prev_gaussian = std::move(curr_gaussian);
         }
         
         // Prepare for next octave
@@ -369,18 +366,16 @@ bool refine_or_discard_keypoint(Keypoint& kp, const std::vector<Image>& octave,
 //    return keypoints;
 //}
 
-// NEW: Fast extremum check using direct pointers (avoids get_pixel() calls)
+
 inline bool point_is_extremum_fast(const float* img, const float* prev, const float* next,
                                    int x, int y, int width, float center_val)
 {
     bool is_min = true, is_max = true;
     
-    // Check 26 neighbors using direct pointer arithmetic
     int row_offset = y * width;
     int prev_row_offset = (y - 1) * width;
     int next_row_offset = (y + 1) * width;
     
-    // Previous scale plane (3กั3 neighbors)
     for (int dy = -1; dy <= 1; dy++) {
         int prow = (y + dy) * width;
         for (int dx = -1; dx <= 1; dx++) {
@@ -391,7 +386,6 @@ inline bool point_is_extremum_fast(const float* img, const float* prev, const fl
         }
     }
     
-    // Current scale plane (8 neighbors)
     for (int dy = -1; dy <= 1; dy++) {
         int crow = (y + dy) * width;
         for (int dx = -1; dx <= 1; dx++) {
@@ -403,7 +397,6 @@ inline bool point_is_extremum_fast(const float* img, const float* prev, const fl
         }
     }
     
-    // Next scale plane (3กั3 neighbors)
     for (int dy = -1; dy <= 1; dy++) {
         int nrow = (y + dy) * width;
         for (int dx = -1; dx <= 1; dx++) {
@@ -432,7 +425,6 @@ std::vector<Keypoint> find_keypoints(const ScaleSpacePyramid& dog_pyramid,
             thread_keypoints.resize(omp_get_num_threads());
         }
         
-        // CHANGED: Y-outer, X-inner (row-major order)
         #pragma omp for collapse(2) schedule(dynamic)
         for (int i = start_octave; i < end_octave; i++) {
             for (int j = 1; j < dog_pyramid.imgs_per_octave-1; j++) {
@@ -450,7 +442,6 @@ std::vector<Keypoint> find_keypoints(const ScaleSpacePyramid& dog_pyramid,
                 float contrast_check_thresh = 0.8f * contrast_thresh;
                 int thread_id = omp_get_thread_num();
                 
-                // CHANGED: Y-OUTER for sequential memory access
                 for (int y = 1; y < height - 1; y++) {
                     int row_offset = y * width;
                     
@@ -458,12 +449,10 @@ std::vector<Keypoint> find_keypoints(const ScaleSpacePyramid& dog_pyramid,
                         int idx = row_offset + x;
                         float center_val = img_data[idx];
                         
-                        // Quick rejection: contrast check
                         if (std::abs(center_val) < contrast_check_thresh) {
                             continue;
                         }
                         
-                        // Check if extremum (only if contrast passes)
                         if (point_is_extremum_fast(img_data, prev_data, next_data,
                                                    x, y, width, center_val)) {
                             Keypoint kp = {x, y, i, j, -1, -1, -1, -1};
@@ -580,7 +569,6 @@ ScaleSpacePyramid generate_gradient_pyramid(const ScaleSpacePyramid& pyramid)
                 float* gx_row = &gx_out[y * width];
                 float* gy_row = &gy_out[y * width];
                 
-                // Vectorized main loop (no boundary checks)
                 for (int x = 1; x < width - 1 - vec_size; x += vec_size) {
                     // GX computation
                     __m256 left = _mm256_loadu_ps(&row[x - 1]);
@@ -595,14 +583,12 @@ ScaleSpacePyramid generate_gradient_pyramid(const ScaleSpacePyramid& pyramid)
                     _mm256_storeu_ps(&gy_row[x], gy_vec);
                 }
                 
-                // Scalar edges (only 7 pixels per row)
                 for (int x = width - 1 - ((width - 2) % vec_size); x < width - 1; x++) {
                     gx_row[x] = (row[x + 1] - row[x - 1]) * 0.5f;
                     gy_row[x] = (row_p1[x] - row_m1[x]) * 0.5f;
                 }
             }
             
-            // Handle boundary rows (y=0 and y=height-1)
             for (int x = 1; x < width - 1; x++) {
                 gx_out[0 * width + x] = 0.0f;
                 gy_out[0 * width + x] = 0.0f;
@@ -812,78 +798,10 @@ struct LoadBalanceAssignment {
 long long compute_octave_work(int octave_idx, int base_width, int base_height, 
                               int scales_per_octave)
 {
-    // Each octave is 1/4 the size of previous (half width, half height)
-    long long width = base_width >> octave_idx;   // Equivalent to / 2^octave_idx
+    long long width = base_width >> octave_idx;
     long long height = base_height >> octave_idx;
     return width * height * scales_per_octave;
 }
-
-//LoadBalanceAssignment compute_load_balance(int world_size, 
-//                                           int num_octaves, 
-//                                           int img_width, int img_height,
-//                                           int scales_per_octave)
-//{
-//    // Step 1: Calculate work for each octave
-//    std::vector<long long> octave_work(num_octaves);
-//    long long total_work = 0;
-//    
-//    for (int i = 0; i < num_octaves; i++) {
-//        octave_work[i] = compute_octave_work(i, img_width, img_height, scales_per_octave);
-//        total_work += octave_work[i];
-//    }
-//    
-//    // Step 2: Use greedy algorithm to assign octaves to processes
-//    std::vector<long long> process_work(world_size, 0);
-//    std::vector<int> octave_to_process(num_octaves);
-//    
-//    for (int octave = 0; octave < num_octaves; octave++) {
-//        // Find process with minimum current work
-//        int min_process = 0;
-//        long long min_work = process_work[0];
-//        
-//        for (int p = 1; p < world_size; p++) {
-//            if (process_work[p] < min_work) {
-//                min_work = process_work[p];
-//                min_process = p;
-//            }
-//        }
-//        
-//        // Assign this octave to least-loaded process
-//        octave_to_process[octave] = min_process;
-//        process_work[min_process] += octave_work[octave];
-//    }
-//    
-//    // Step 3: Convert to contiguous ranges for each process
-//    LoadBalanceAssignment assignment;
-//    assignment.start_octaves.resize(world_size);
-//    assignment.end_octaves.resize(world_size);
-//    
-//    std::vector<int> first_octave(world_size, num_octaves);  // Initialize to "none"
-//    std::vector<int> last_octave(world_size, -1);            // Initialize to "none"
-//    
-//    for (int octave = 0; octave < num_octaves; octave++) {
-//        int proc = octave_to_process[octave];
-//        if (octave < first_octave[proc]) {
-//            first_octave[proc] = octave;
-//        }
-//        if (octave > last_octave[proc]) {
-//            last_octave[proc] = octave;
-//        }
-//    }
-//    
-//    for (int p = 0; p < world_size; p++) {
-//        if (first_octave[p] == num_octaves) {
-//            // This process got no octaves
-//            assignment.start_octaves[p] = 0;
-//            assignment.end_octaves[p] = 0;
-//        } else {
-//            assignment.start_octaves[p] = first_octave[p];
-//            assignment.end_octaves[p] = last_octave[p] + 1;
-//        }
-//    }
-//    
-//    return assignment;
-//}
 
 LoadBalanceAssignment compute_load_balance(int world_size, 
                                                      int num_octaves, 
@@ -895,7 +813,7 @@ LoadBalanceAssignment compute_load_balance(int world_size,
     long long total_work = 0;
     
     for (int i = 0; i < num_octaves; i++) {
-        long long width = img_width >> i;   // Divide by 2^i
+        long long width = img_width >> i;
         long long height = img_height >> i;
         octave_work[i] = width * height * scales_per_octave;
         total_work += octave_work[i];
@@ -910,7 +828,7 @@ LoadBalanceAssignment compute_load_balance(int world_size,
     for (int i = 0; i < num_octaves; i++) {
         work_idx.push_back({octave_work[i], i});
     }
-    std::sort(work_idx.rbegin(), work_idx.rend());  // Sort descending
+    std::sort(work_idx.rbegin(), work_idx.rend());
     
     for (auto [work, octave] : work_idx) {
         // Find process with minimum current work
@@ -925,7 +843,6 @@ LoadBalanceAssignment compute_load_balance(int world_size,
         process_work[min_proc] += work;
     }
     
-    // Create contiguous ranges
     LoadBalanceAssignment assignment;
     assignment.start_octaves.resize(world_size);
     assignment.end_octaves.resize(world_size);
@@ -950,7 +867,7 @@ OctaveAssignment compute_octave_assignment(int rank, int world_size,
                                            int img_width, int img_height,
                                            int scales_per_octave)
 {
-    // Step 1: Calculate work for each octave
+    // Calculate work for each octave
     long long total_work = 0;
     std::vector<long long> octave_work(num_octaves);
     
@@ -959,7 +876,6 @@ OctaveAssignment compute_octave_assignment(int rank, int world_size,
         total_work += octave_work[i];
     }
     
-    // Step 2: Precompute all process assignments
     std::vector<std::pair<int, int>> process_ranges(world_size, {-1, -1});
     long long work_per_process = total_work / world_size;
     long long current_work = 0;
@@ -969,12 +885,9 @@ OctaveAssignment compute_octave_assignment(int rank, int world_size,
     for (int octave = 0; octave < num_octaves; octave++) {
         current_work += octave_work[octave];
         
-        // For non-last processes: move to next if work exceeds target AND we're not at the last octave
-        // For last process: gets all remaining octaves
         bool move_to_next = false;
         
         if (current_process < world_size - 1) {
-            // If we exceed target work, move to next process
             if (current_work > work_per_process && octave < num_octaves - 1) {
                 move_to_next = true;
             }
@@ -986,14 +899,12 @@ OctaveAssignment compute_octave_assignment(int rank, int world_size,
             start_octave = octave;
             current_work = octave_work[octave];
         }
-        
-        // Last octave: assign remaining octaves to current process
+
         if (octave == num_octaves - 1) {
             process_ranges[current_process] = {start_octave, octave + 1};
         }
     }
     
-    // Step 3: Return assignment for this rank
     OctaveAssignment assignment;
     assignment.start_octave = 0;
     assignment.end_octave = 0;
@@ -1017,7 +928,7 @@ OctaveAssignment compute_octave_assignment_greedy(int rank, int world_size,
                                                    int img_width, int img_height,
                                                    int scales_per_octave)
 {
-    // Step 1: Calculate work for each octave
+
     std::vector<long long> octave_work(num_octaves);
     long long total_work = 0;
     
@@ -1026,12 +937,10 @@ OctaveAssignment compute_octave_assignment_greedy(int rank, int world_size,
         total_work += octave_work[i];
     }
     
-    // Step 2: Assign each octave to the process with least work (greedy)
     std::vector<long long> process_work(world_size, 0);
     std::vector<int> octave_to_process(num_octaves);
     
     for (int octave = 0; octave < num_octaves; octave++) {
-        // Find process with minimum current work
         int min_process = 0;
         long long min_work = process_work[0];
         
@@ -1042,12 +951,10 @@ OctaveAssignment compute_octave_assignment_greedy(int rank, int world_size,
             }
         }
         
-        // Assign this octave to least-loaded process
         octave_to_process[octave] = min_process;
         process_work[min_process] += octave_work[octave];
     }
     
-    // Step 3: Find start and end for this rank
     OctaveAssignment assignment;
     assignment.start_octave = num_octaves;  // Default: no octaves
     assignment.end_octave = num_octaves;
@@ -1107,10 +1014,7 @@ std::vector<Keypoint> find_keypoints_and_descriptors(const Image& img,
 
     // --- Difference of Gaussians (DoG) Pyramid ---
     start_step = std::chrono::high_resolution_clock::now();
-    ScaleSpacePyramid dog_pyramid = generate_dog_pyramid(gaussian_pyramid);
-    // NEW SIGNATURE (fused operation)
-    //ScaleSpacePyramid dog_pyramid = generate_dog_pyramid_fused(input, sigma_min, num_octaves, scales_per_octave);
-    
+    ScaleSpacePyramid dog_pyramid = generate_dog_pyramid(gaussian_pyramid);    
     
     MPI_Barrier(MPI_COMM_WORLD);
     end_step = std::chrono::high_resolution_clock::now();
@@ -1137,7 +1041,6 @@ std::vector<Keypoint> find_keypoints_and_descriptors(const Image& img,
                                                input.width, input.height, 
                                                scales_per_octave);
         
-        // Debug output
         std::cout << "[DEBUG] Load balancing info:\n";
         for (int r = 0; r < size; r++) {
             std::cout << "  Process " << r << ": octaves [" 
@@ -1170,8 +1073,6 @@ std::vector<Keypoint> find_keypoints_and_descriptors(const Image& img,
         std::cout << "  [TIMING] Keypoint detection: " << duration.count() << " ms\n";
     }
     
-    // -------------------------
-
     // --- Orientation and Descriptor Generation ---
     start_step = std::chrono::high_resolution_clock::now();
     std::vector<Keypoint> local_kps;
@@ -1191,7 +1092,7 @@ std::vector<Keypoint> find_keypoints_and_descriptors(const Image& img,
             Keypoint& kp_tmp = local_tmp_kps[i];
             std::vector<float> orientations = find_keypoint_orientations(kp_tmp, grad_pyramid, lambda_ori, lambda_desc);
             for (float theta : orientations) {
-                Keypoint kp = kp_tmp; // Create a new keypoint for each orientation
+                Keypoint kp = kp_tmp;
                 compute_keypoint_descriptor(kp, theta, grad_pyramid, lambda_desc);
                 thread_local_kps[omp_get_thread_num()].push_back(kp);
             }

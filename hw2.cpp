@@ -59,7 +59,6 @@ int main(int argc, char *argv[])
     std::vector<Keypoint> local_kps = find_keypoints_and_descriptors(gray_img, world_rank, world_size);
       
     
-    // Define packet size: 4 ints + 2 floats (treated as ints) + 128 descriptor ints.
     const int ints_per_float = sizeof(float) / sizeof(int);
     const int ints_per_kp = 4 + (2 * ints_per_float) + 128;
     int local_kp_count = local_kps.size();
@@ -73,7 +72,6 @@ int main(int argc, char *argv[])
          offset[2] = kp.octave;
          offset[3] = kp.scale;
          
-         // Safely copy float bytes into the integer array for transport.
          std::memcpy(&offset[4], &kp.x, sizeof(float));
          std::memcpy(&offset[4 + ints_per_float], &kp.y, sizeof(float));
   
@@ -86,7 +84,6 @@ int main(int argc, char *argv[])
     MPI_Gather(&local_kp_count, 1, MPI_INT, recv_counts.data(), 1, MPI_INT, 0, MPI_COMM_WORLD);
     
     if (world_rank == 0) {
-        // Calculate total keypoints and displacements for MPI_Gatherv
         int total_kps = std::accumulate(recv_counts.begin(), recv_counts.end(), 0);
         std::vector<Keypoint> all_kps;
         all_kps.reserve(total_kps);
@@ -145,8 +142,6 @@ int main(int argc, char *argv[])
         Image original_img(input_img);
         Image result = draw_keypoints(original_img, all_kps);
         result.save(output_img);
-        // Image result = draw_keypoints(img, all_kps);
-        // result.save(output_img);
         
         auto end = std::chrono::high_resolution_clock::now();
         

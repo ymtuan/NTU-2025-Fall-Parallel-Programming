@@ -7,16 +7,16 @@ Looking for sift.hpp: [32mOK[0m
 Looking for stb_image.h: [32mOK[0m
 Looking for stb_image_write.h: [32mOK[0m
 Looking for Makefile: [32mOK[0m
-Running: /usr/bin/make -C /home/b12901069/.judge.862160669 hw2
-make: Entering directory '/home/b12901069/.judge.862160669'
+Running: /usr/bin/make -C /home/b12901069/.judge.1852287993 hw2
+make: Entering directory '/home/b12901069/.judge.1852287993'
 mpicxx -std=c++17 -O3 -fopenmp -mavx2 -mfma -march=native -I. -c hw2.cpp
 mpicxx -std=c++17 -O3 -fopenmp -mavx2 -mfma -march=native -I. -c sift.cpp
 mpicxx -std=c++17 -O3 -fopenmp -mavx2 -mfma -march=native -I. -c image.cpp
 mpicxx -std=c++17 -O3 -fopenmp -mavx2 -mfma -march=native -o hw2 hw2.o sift.o image.o
-make: Leaving directory '/home/b12901069/.judge.862160669'
-2   13.41   [32maccepted[0m
-4   18.97   [32maccepted[0m
-6   23.88   [32maccepted[0m
-8   26.99   [32maccepted[0m
-Removing temporary directory /home/b12901069/.judge.862160669
-Scoreboard: updated {4 89.90} --> {4 83.25}
+make: Leaving directory '/home/b12901069/.judge.1852287993'
+2   14.79   [32maccepted[0m
+4   17.72   [32maccepted[0m
+6   24.34   [32maccepted[0m
+8   28.10   [32maccepted[0m
+Removing temporary directory /home/b12901069/.judge.1852287993
+Scoreboard: not updating {4 83.25} -x-> {4 84.95}
