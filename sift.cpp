@@ -44,6 +44,7 @@ ScaleSpacePyramid generate_gaussian_pyramid(const Image& img, float sigma_min,
         imgs_per_octave,
         std::vector<std::vector<Image>>(num_octaves)
     };
+    
     for (int i = 0; i < num_octaves; i++) {
         pyramid.octaves[i].reserve(imgs_per_octave);
         pyramid.octaves[i].push_back(std::move(base_img));
@@ -56,8 +57,10 @@ ScaleSpacePyramid generate_gaussian_pyramid(const Image& img, float sigma_min,
         base_img = next_base_img.resize(next_base_img.width/2, next_base_img.height/2,
                                         Interpolation::NEAREST);
     }
+
     return pyramid;
 }
+
 
 // generate pyramid of difference of gaussians (DoG) images
 //ScaleSpacePyramid generate_dog_pyramid(const ScaleSpacePyramid& img_pyramid)

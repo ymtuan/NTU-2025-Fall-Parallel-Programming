@@ -2,6 +2,7 @@
 #include <iostream>
 #include <cassert>
 #include <utility>
+#include <chrono>
 #include <omp.h>
 #include <immintrin.h>
 
@@ -322,6 +323,8 @@ Image grayscale_to_rgb(const Image& img)
 Image gaussian_blur(const Image& img, float sigma)
 {
     assert(img.channels == 1);
+    
+    auto blur_start = std::chrono::high_resolution_clock::now();
 
     int size = std::ceil(6 * sigma);
     if (size % 2 == 0)
@@ -378,7 +381,7 @@ Image gaussian_blur(const Image& img, float sigma)
             tmp_row[x] = sum;
         }
     }
-
+    
     // HORIZONTAL PASS with SIMD (similar structure)
     #pragma omp parallel for schedule(guided)
     for (int y = 0; y < img.height; y++) {
