@@ -16,56 +16,11 @@
 
 
 
-//ScaleSpacePyramid generate_gaussian_pyramid(const Image& img, float sigma_min,
-//                                            int num_octaves, int scales_per_octave)
-//{
-//    // assume initial sigma is 1.0 (after resizing) and smooth
-//    // the image with sigma_diff to reach requried base_sigma
-//    float base_sigma = sigma_min / MIN_PIX_DIST;
-//    Image base_img = img.resize(img.width*2, img.height*2, Interpolation::BILINEAR);
-//    float sigma_diff = std::sqrt(base_sigma*base_sigma - 1.0f);
-//    base_img = gaussian_blur(base_img, sigma_diff);
-//
-//    int imgs_per_octave = scales_per_octave + 3;
-//
-//    // determine sigma values for bluring
-//    float k = std::pow(2, 1.0/scales_per_octave);
-//    std::vector<float> sigma_vals {base_sigma};
-//    for (int i = 1; i < imgs_per_octave; i++) {
-//        float sigma_prev = base_sigma * std::pow(k, i-1);
-//        float sigma_total = k * sigma_prev;
-//        sigma_vals.push_back(std::sqrt(sigma_total*sigma_total - sigma_prev*sigma_prev));
-//    }
-//
-//    // create a scale space pyramid of gaussian images
-//    // images in each octave are half the size of images in the previous one
-//    ScaleSpacePyramid pyramid = {
-//        num_octaves,
-//        imgs_per_octave,
-//        std::vector<std::vector<Image>>(num_octaves)
-//    };
-//    
-//    for (int i = 0; i < num_octaves; i++) {
-//        pyramid.octaves[i].reserve(imgs_per_octave);
-//        pyramid.octaves[i].push_back(std::move(base_img));
-//        for (int j = 1; j < sigma_vals.size(); j++) {
-//            const Image& prev_img = pyramid.octaves[i].back();
-//            pyramid.octaves[i].push_back(gaussian_blur(prev_img, sigma_vals[j]));
-//        }
-//        // prepare base image for next octave
-//        const Image& next_base_img = pyramid.octaves[i][imgs_per_octave-3];
-//        base_img = next_base_img.resize(next_base_img.width/2, next_base_img.height/2,
-//                                        Interpolation::NEAREST);
-//    }
-//
-//    return pyramid;
-//}
-
 ScaleSpacePyramid generate_gaussian_pyramid(const Image& img, float sigma_min,
                                             int num_octaves, int scales_per_octave)
 {
     // assume initial sigma is 1.0 (after resizing) and smooth
-    // the image with sigma_diff to reach required base_sigma
+    // the image with sigma_diff to reach requried base_sigma
     float base_sigma = sigma_min / MIN_PIX_DIST;
     Image base_img = img.resize(img.width*2, img.height*2, Interpolation::BILINEAR);
     float sigma_diff = std::sqrt(base_sigma*base_sigma - 1.0f);
@@ -73,7 +28,7 @@ ScaleSpacePyramid generate_gaussian_pyramid(const Image& img, float sigma_min,
 
     int imgs_per_octave = scales_per_octave + 3;
 
-    // determine sigma values for blurring
+    // determine sigma values for bluring
     float k = std::pow(2, 1.0/scales_per_octave);
     std::vector<float> sigma_vals {base_sigma};
     for (int i = 1; i < imgs_per_octave; i++) {
@@ -95,15 +50,12 @@ ScaleSpacePyramid generate_gaussian_pyramid(const Image& img, float sigma_min,
         pyramid.octaves[i].push_back(std::move(base_img));
         for (int j = 1; j < sigma_vals.size(); j++) {
             const Image& prev_img = pyramid.octaves[i].back();
-            // Use cached kernel version for performance
-            pyramid.octaves[i].push_back(gaussian_blur_with_cached_kernel(prev_img, sigma_vals[j]));
+            pyramid.octaves[i].push_back(gaussian_blur(prev_img, sigma_vals[j]));
         }
         // prepare base image for next octave
-        if (i < num_octaves - 1) {
-            const Image& next_base_img = pyramid.octaves[i][imgs_per_octave-3];
-            base_img = next_base_img.resize(next_base_img.width/2, next_base_img.height/2, Interpolation::NEAREST);
-            //base_img = downsample_2x(next_base_img);
-        }
+        const Image& next_base_img = pyramid.octaves[i][imgs_per_octave-3];
+        base_img = next_base_img.resize(next_base_img.width/2, next_base_img.height/2,
+                                        Interpolation::NEAREST);
     }
 
     return pyramid;
@@ -535,6 +487,66 @@ std::vector<Keypoint> find_keypoints(const ScaleSpacePyramid& dog_pyramid,
 }
 
 // calculate x and y derivatives for all images in the input pyramid
+//ScaleSpacePyramid generate_gradient_pyramid(const ScaleSpacePyramid& pyramid)
+//{
+//    ScaleSpacePyramid grad_pyramid = {
+//        pyramid.num_octaves,
+//        pyramid.imgs_per_octave,
+//        std::vector<std::vector<Image>>(pyramid.num_octaves)
+//    };
+//    for (int i = 0; i < pyramid.num_octaves; i++) {
+//        grad_pyramid.octaves[i].reserve(grad_pyramid.imgs_per_octave);
+//        int width = pyramid.octaves[i][0].width;
+//        int height = pyramid.octaves[i][0].height;
+//        for (int j = 0; j < pyramid.imgs_per_octave; j++) {
+//            Image grad(width, height, 2);
+////            #pragma omp parallel for schedule(static)
+////            for (int y = 1; y < grad.height-1; y++) {
+////              for (int x = 1; x < grad.width-1; x++) {
+////                    float gx = (pyramid.octaves[i][j].get_pixel(x+1, y, 0)
+////                         -pyramid.octaves[i][j].get_pixel(x-1, y, 0)) * 0.5;
+////                    grad.set_pixel(x, y, 0, gx);
+////                    float gy = (pyramid.octaves[i][j].get_pixel(x, y+1, 0)
+////                         -pyramid.octaves[i][j].get_pixel(x, y-1, 0)) * 0.5;
+////                    grad.set_pixel(x, y, 1, gy);
+////                }
+////            }
+//            #pragma omp parallel for schedule(static)
+//            for (int y = 1; y < grad.height - 1; y++) {
+//                const float* row_m1 = &pyramid.octaves[i][j].data[(y - 1) * width];
+//                const float* row = &pyramid.octaves[i][j].data[y * width];
+//                const float* row_p1 = &pyramid.octaves[i][j].data[(y + 1) * width];
+//                float* gx_row = &grad.data[y * width];      // ch0 starts at 0
+//                float* gy_row = &grad.data[grad.size / 2 + y * width];  // ch1 at size/2
+//            
+//                __m256 half = _mm256_set1_ps(0.5f);
+//                int vec_size = 8;
+//                for (int x = 1; x < grad.width - 1 - vec_size + 1; x += vec_size) {
+//                    __m256 left = _mm256_loadu_ps(&row[x - 1]);
+//                    __m256 right = _mm256_loadu_ps(&row[x + 1]);
+//                    __m256 gx_vec = _mm256_mul_ps(_mm256_sub_ps(right, left), half);
+//                    _mm256_storeu_ps(&gx_row[x], gx_vec);
+//            
+//                    __m256 up = _mm256_loadu_ps(&row_m1[x]);
+//                    __m256 down = _mm256_loadu_ps(&row_p1[x]);
+//                    __m256 gy_vec = _mm256_mul_ps(_mm256_sub_ps(down, up), half);
+//                    _mm256_storeu_ps(&gy_row[x], gy_vec);
+//                }
+//                // Scalar remainder
+//                for (int x = ((grad.width - 2) / vec_size) * vec_size + 1; x < grad.width - 1; x++) {
+//                    float gx = (row[x + 1] - row[x - 1]) * 0.5f;
+//                    gx_row[x] = gx;
+//                    float gy = (row_p1[x] - row_m1[x]) * 0.5f;
+//                    gy_row[x] = gy;
+//                }
+//            }
+//                        
+//            grad_pyramid.octaves[i].push_back(grad);
+//        }
+//    }
+//    return grad_pyramid;
+//}
+
 ScaleSpacePyramid generate_gradient_pyramid(const ScaleSpacePyramid& pyramid)
 {
     ScaleSpacePyramid grad_pyramid = {
@@ -558,49 +570,35 @@ ScaleSpacePyramid generate_gradient_pyramid(const ScaleSpacePyramid& pyramid)
             const __m256 half = _mm256_set1_ps(0.5f);
             const int vec_size = 8;
             
-            // ===== OPTIMIZATION: Use local buffers to avoid cache ping-pong =====
-            
+            // Row-wise processing for cache efficiency
             #pragma omp parallel for schedule(static)
             for (int y = 1; y < height - 1; y++) {
                 const float* row_m1 = &src[(y - 1) * width];
                 const float* row = &src[y * width];
                 const float* row_p1 = &src[(y + 1) * width];
                 
-                // Local buffers (stack allocation, cache-friendly)
-                std::vector<float> gx_local(width);
-                std::vector<float> gy_local(width);
+                float* gx_row = &gx_out[y * width];
+                float* gy_row = &gy_out[y * width];
                 
-                // Main computation loop - write to local buffers
-                int x = 1;
-                
-                // Vectorized loop
-                for (; x < width - 1 - vec_size; x += vec_size) {
+                // Vectorized main loop (no boundary checks)
+                for (int x = 1; x < width - 1 - vec_size; x += vec_size) {
                     // GX computation
                     __m256 left = _mm256_loadu_ps(&row[x - 1]);
                     __m256 right = _mm256_loadu_ps(&row[x + 1]);
                     __m256 gx_vec = _mm256_mul_ps(_mm256_sub_ps(right, left), half);
-                    _mm256_storeu_ps(&gx_local[x], gx_vec);
+                    _mm256_storeu_ps(&gx_row[x], gx_vec);
                     
                     // GY computation
                     __m256 up = _mm256_loadu_ps(&row_m1[x]);
                     __m256 down = _mm256_loadu_ps(&row_p1[x]);
                     __m256 gy_vec = _mm256_mul_ps(_mm256_sub_ps(down, up), half);
-                    _mm256_storeu_ps(&gy_local[x], gy_vec);
+                    _mm256_storeu_ps(&gy_row[x], gy_vec);
                 }
                 
-                // Scalar remainder
-                for (; x < width - 1; x++) {
-                    gx_local[x] = (row[x + 1] - row[x - 1]) * 0.5f;
-                    gy_local[x] = (row_p1[x] - row_m1[x]) * 0.5f;
-                }
-                
-                // Sequential write to global memory (cache-friendly!)
-                float* gx_row = &gx_out[y * width];
-                float* gy_row = &gy_out[y * width];
-                
-                for (int x = 1; x < width - 1; x++) {
-                    gx_row[x] = gx_local[x];
-                    gy_row[x] = gy_local[x];
+                // Scalar edges (only 7 pixels per row)
+                for (int x = width - 1 - ((width - 2) % vec_size); x < width - 1; x++) {
+                    gx_row[x] = (row[x + 1] - row[x - 1]) * 0.5f;
+                    gy_row[x] = (row_p1[x] - row_m1[x]) * 0.5f;
                 }
             }
             
@@ -617,75 +615,6 @@ ScaleSpacePyramid generate_gradient_pyramid(const ScaleSpacePyramid& pyramid)
     }
     return grad_pyramid;
 }
-
-//ScaleSpacePyramid generate_gradient_pyramid(const ScaleSpacePyramid& pyramid)
-//{
-//    ScaleSpacePyramid grad_pyramid = {
-//        pyramid.num_octaves,
-//        pyramid.imgs_per_octave,
-//        std::vector<std::vector<Image>>(pyramid.num_octaves)
-//    };
-//    
-//    for (int i = 0; i < pyramid.num_octaves; i++) {
-//        grad_pyramid.octaves[i].reserve(grad_pyramid.imgs_per_octave);
-//        int width = pyramid.octaves[i][0].width;
-//        int height = pyramid.octaves[i][0].height;
-//        
-//        for (int j = 0; j < pyramid.imgs_per_octave; j++) {
-//            Image grad(width, height, 2);
-//            
-//            const float* src = pyramid.octaves[i][j].data;
-//            float* gx_out = grad.data;
-//            float* gy_out = grad.data + width * height;
-//            
-//            const __m256 half = _mm256_set1_ps(0.5f);
-//            const int vec_size = 8;
-//            
-//            // Row-wise processing for cache efficiency
-//            #pragma omp parallel for schedule(static)
-//            for (int y = 1; y < height - 1; y++) {
-//                const float* row_m1 = &src[(y - 1) * width];
-//                const float* row = &src[y * width];
-//                const float* row_p1 = &src[(y + 1) * width];
-//                
-//                float* gx_row = &gx_out[y * width];
-//                float* gy_row = &gy_out[y * width];
-//                
-//                // Vectorized main loop (no boundary checks)
-//                for (int x = 1; x < width - 1 - vec_size; x += vec_size) {
-//                    // GX computation
-//                    __m256 left = _mm256_loadu_ps(&row[x - 1]);
-//                    __m256 right = _mm256_loadu_ps(&row[x + 1]);
-//                    __m256 gx_vec = _mm256_mul_ps(_mm256_sub_ps(right, left), half);
-//                    _mm256_storeu_ps(&gx_row[x], gx_vec);
-//                    
-//                    // GY computation
-//                    __m256 up = _mm256_loadu_ps(&row_m1[x]);
-//                    __m256 down = _mm256_loadu_ps(&row_p1[x]);
-//                    __m256 gy_vec = _mm256_mul_ps(_mm256_sub_ps(down, up), half);
-//                    _mm256_storeu_ps(&gy_row[x], gy_vec);
-//                }
-//                
-//                // Scalar edges (only 7 pixels per row)
-//                for (int x = width - 1 - ((width - 2) % vec_size); x < width - 1; x++) {
-//                    gx_row[x] = (row[x + 1] - row[x - 1]) * 0.5f;
-//                    gy_row[x] = (row_p1[x] - row_m1[x]) * 0.5f;
-//                }
-//            }
-//            
-//            // Handle boundary rows (y=0 and y=height-1)
-//            for (int x = 1; x < width - 1; x++) {
-//                gx_out[0 * width + x] = 0.0f;
-//                gy_out[0 * width + x] = 0.0f;
-//                gx_out[(height-1) * width + x] = 0.0f;
-//                gy_out[(height-1) * width + x] = 0.0f;
-//            }
-//            
-//            grad_pyramid.octaves[i].push_back(grad);
-//        }
-//    }
-//    return grad_pyramid;
-//}
 
 
 // convolve 6x with box filter
@@ -728,7 +657,7 @@ std::vector<float> find_keypoint_orientations(Keypoint& kp,
     int y_start = std::round((kp.y - patch_radius)/pix_dist);
     int y_end = std::round((kp.y + patch_radius)/pix_dist);
 
-    
+    // accumulate gradients in orientation histogram
     #pragma omp parallel for schedule(static) reduction(+:hist[0:N_BINS])
     for (int x = x_start; x <= x_end; x++) {
         for (int y = y_start; y <= y_end; y++) {
@@ -836,11 +765,6 @@ void compute_keypoint_descriptor(Keypoint& kp, float theta,
     float sin_t = std::sin(theta);
     float patch_sigma = lambda_desc * kp.sigma;
     
-    // new add
-    int width = img_grad.width;
-    const float* gx_data = img_grad.data;                            // Channel 0
-    const float* gy_data = img_grad.data + width * img_grad.height;  // Channel 1
-    
     //accumulate samples into histograms
     for (int m = x_start; m <= x_end; m++) {
         for (int n = y_start; n <= y_end; n++) {
@@ -854,9 +778,7 @@ void compute_keypoint_descriptor(Keypoint& kp, float theta,
             if (std::max(std::abs(x), std::abs(y)) > lambda_desc*(N_HIST+1.)/N_HIST)
                 continue;
 
-            // float gx = img_grad.get_pixel(m, n, 0), gy = img_grad.get_pixel(m, n, 1);
-            float gx = gx_data[n * width + m];
-            float gy = gy_data[n * width + m];
+            float gx = img_grad.get_pixel(m, n, 0), gy = img_grad.get_pixel(m, n, 1);
             float theta_mn = std::fmod(std::atan2(gy, gx)-theta+4*M_PI, 2*M_PI);
             
             float grad_norm = std::sqrt(gx*gx + gy*gy);

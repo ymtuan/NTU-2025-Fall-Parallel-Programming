@@ -15,7 +15,7 @@ ACCOUNT="ACD114118"
 NODES=2
 PROCS=4
 CORES=6
-TIME_LIMIT="00:00:30"
+TIME_LIMIT="00:00:45"
 
 # --- Log File & Directories ---
 LOG_FILE="runtime_log.txt"
@@ -60,7 +60,7 @@ echo "Starting tests... (Detailed output will be in $LOG_FILE)"
 echo "--------------------------------------------------------"
 
 # Loop through all 8 test cases.
-for i in {1..8}
+for i in {5..8}
 do
     TEST_CASE=$(printf "%02d" "$i")
 

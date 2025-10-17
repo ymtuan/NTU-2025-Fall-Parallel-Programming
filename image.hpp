@@ -1,7 +1,6 @@
 #ifndef IMAGE_H
 #define IMAGE_H
 #include <string>
-#include <vector>
 
 enum Interpolation {BILINEAR, NEAREST};
 
@@ -38,9 +37,5 @@ Image gaussian_blur(const Image& img, float sigma);
 void draw_point(Image& img, int x, int y, int size=3);
 void draw_line(Image& img, int x1, int y1, int x2, int y2);
 
-std::vector<float> get_or_compute_kernel(float sigma);
-Image gaussian_blur_with_cached_kernel(const Image& img, float sigma);
-
-Image downsample_2x(const Image& img);
 
 #endif
