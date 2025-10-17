@@ -988,51 +988,18 @@ std::vector<Keypoint> find_keypoints_and_descriptors(const Image& img,
     
     assert(img.channels == 1 || img.channels == 3);
 
-    // --- Timing Setup ---
-    auto start_total = std::chrono::high_resolution_clock::now();
-    auto start_step = start_total;
-    auto end_step = start_total;
-
     // --- Grayscale Conversion ---
     const Image& input = img.channels == 1 ? img : rgb_to_grayscale(img);
-    MPI_Barrier(MPI_COMM_WORLD); // Synchronize all processes
-    end_step = std::chrono::high_resolution_clock::now();
-    if (rank == 0) {
-        std::chrono::duration<double, std::milli> duration = end_step - start_step;
-        std::cout << "  [TIMING] Grayscale conversion: " << duration.count() << " ms\n";
-    }
 
     // --- Gaussian Pyramid ---
-    start_step = std::chrono::high_resolution_clock::now();
     ScaleSpacePyramid gaussian_pyramid = generate_gaussian_pyramid(input, sigma_min, num_octaves, scales_per_octave);
-    MPI_Barrier(MPI_COMM_WORLD);
-    end_step = std::chrono::high_resolution_clock::now();
-    if (rank == 0) {
-        std::chrono::duration<double, std::milli> duration = end_step - start_step;
-        std::cout << "  [TIMING] Gaussian pyramid generation: " << duration.count() << " ms\n";
-    }
 
     // --- Difference of Gaussians (DoG) Pyramid ---
-    start_step = std::chrono::high_resolution_clock::now();
     ScaleSpacePyramid dog_pyramid = generate_dog_pyramid(gaussian_pyramid);    
     
-    MPI_Barrier(MPI_COMM_WORLD);
-    end_step = std::chrono::high_resolution_clock::now();
-    if (rank == 0) {
-        std::chrono::duration<double, std::milli> duration = end_step - start_step;
-        std::cout << "  [TIMING] DoG pyramid generation: " << duration.count() << " ms\n";
-    }
-
     // --- Gradient Pyramid ---
-    start_step = std::chrono::high_resolution_clock::now();
     ScaleSpacePyramid grad_pyramid = generate_gradient_pyramid(gaussian_pyramid);
-    MPI_Barrier(MPI_COMM_WORLD);
-    end_step = std::chrono::high_resolution_clock::now();
-    if (rank == 0) {
-        std::chrono::duration<double, std::milli> duration = end_step - start_step;
-        std::cout << "  [TIMING] Gradient pyramid generation: " << duration.count() << " ms\n";
-    }
-
+    
     // --- Keypoint Detection ---
     LoadBalanceAssignment load_assignment;
     
@@ -1040,13 +1007,6 @@ std::vector<Keypoint> find_keypoints_and_descriptors(const Image& img,
         load_assignment = compute_load_balance(size, num_octaves, 
                                                input.width, input.height, 
                                                scales_per_octave);
-        
-        std::cout << "[DEBUG] Load balancing info:\n";
-        for (int r = 0; r < size; r++) {
-            std::cout << "  Process " << r << ": octaves [" 
-                      << load_assignment.start_octaves[r] << ", " 
-                      << load_assignment.end_octaves[r] << ")\n";
-        }
     }
     
     // Broadcast start_octaves array
@@ -1064,17 +1024,9 @@ std::vector<Keypoint> find_keypoints_and_descriptors(const Image& img,
     int start_octave = start_octaves_bcast[rank];
     int end_octave = end_octaves_bcast[rank];
         
-    start_step = std::chrono::high_resolution_clock::now();
     std::vector<Keypoint> local_tmp_kps = find_keypoints(dog_pyramid, start_octave, end_octave, contrast_thresh, edge_thresh);
-    MPI_Barrier(MPI_COMM_WORLD);
-    end_step = std::chrono::high_resolution_clock::now();
-    if (rank == 0) {
-        std::chrono::duration<double, std::milli> duration = end_step - start_step;
-        std::cout << "  [TIMING] Keypoint detection: " << duration.count() << " ms\n";
-    }
     
     // --- Orientation and Descriptor Generation ---
-    start_step = std::chrono::high_resolution_clock::now();
     std::vector<Keypoint> local_kps;
     local_kps.reserve(local_tmp_kps.size() * 2);
 
@@ -1102,15 +1054,10 @@ std::vector<Keypoint> find_keypoints_and_descriptors(const Image& img,
     for (const auto& vec : thread_local_kps) {
         local_kps.insert(local_kps.end(), vec.begin(), vec.end());
     }
-    MPI_Barrier(MPI_COMM_WORLD);
-    end_step = std::chrono::high_resolution_clock::now();
-    if (rank == 0) {
-        std::chrono::duration<double, std::milli> duration = end_step - start_step;
-        std::cout << "  [TIMING] Orientation and descriptor generation: " << duration.count() << " ms\n";
-    }
 
     return local_kps;
 }
+
 
 float euclidean_dist(std::array<uint8_t, 128>& a, std::array<uint8_t, 128>& b)
 {
