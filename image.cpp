@@ -320,17 +320,16 @@ Image grayscale_to_rgb(const Image& img)
 //    }
 //    return filtered;
 //}
+
 Image gaussian_blur(const Image& img, float sigma)
 {
     assert(img.channels == 1);
     
-    auto blur_start = std::chrono::high_resolution_clock::now();
-
     int size = std::ceil(6 * sigma);
-    if (size % 2 == 0)
-        size++;
+    if (size % 2 == 0) size++;
     int center = size / 2;
     
+    // Pre-compute kernel
     Image kernel(size, 1, 1);
     float sum = 0;
     for (int k = -size/2; k <= size/2; k++) {
@@ -344,71 +343,85 @@ Image gaussian_blur(const Image& img, float sigma)
     Image tmp(img.width, img.height, 1);
     Image filtered(img.width, img.height, 1);
 
-    // VERTICAL PASS with SIMD
-    #pragma omp parallel for schedule(guided)
-    for (int y = 0; y < img.height; y++) {
-        float* tmp_row = tmp.data + y * img.width;
+    // ===== VERTICAL PASS (optimized) =====
+    const int BLOCK_SIZE = 64;  // Cache block for better locality
+    const int vec_size = 8;
+    const float* img_data = img.data;
+    const float* kern_data = kernel.data;
+    float* tmp_data = tmp.data;
+    int width = img.width;
+    int height = img.height;
+
+    #pragma omp parallel for schedule(static) collapse(1)
+    for (int y = 0; y < height; y++) {
+        float* tmp_row = tmp_data + y * width;
         
+        // Vectorized inner loop - no boundary checks in critical path
         int x = 0;
-        int vec_size = 8;  // AVX2
         
-        // Vectorized loop
-        for (; x <= img.width - vec_size; x += vec_size) {
+        // Fast path: process bulk without boundary checks
+        for (; x <= width - vec_size; x += vec_size) {
             __m256 sum_vec = _mm256_setzero_ps();
             
+            #pragma omp simd
             for (int k = 0; k < size; k++) {
                 int iy = y + (-center + k);
+                // Clamp OUTSIDE the vectorized loop
                 if (iy < 0) iy = 0;
-                if (iy >= img.height) iy = img.height - 1;
+                if (iy >= height) iy = height - 1;
                 
-                __m256 vals = _mm256_loadu_ps(&img.data[iy * img.width + x]);
-                __m256 kern = _mm256_set1_ps(kernel.data[k]);
+                __m256 vals = _mm256_loadu_ps(&img_data[iy * width + x]);
+                __m256 kern = _mm256_set1_ps(kern_data[k]);
                 sum_vec = _mm256_fmadd_ps(vals, kern, sum_vec);
             }
             
             _mm256_storeu_ps(tmp_row + x, sum_vec);
         }
         
-        // Scalar remainder
-        for (; x < img.width; x++) {
-            float sum = 0;
+        // Scalar remainder (small, amortized cost)
+        for (; x < width; x++) {
+            float sum = 0.0f;
             for (int k = 0; k < size; k++) {
                 int iy = y + (-center + k);
                 if (iy < 0) iy = 0;
-                if (iy >= img.height) iy = img.height - 1;
-                sum += img.data[iy * img.width + x] * kernel.data[k];
+                if (iy >= height) iy = height - 1;
+                sum += img_data[iy * width + x] * kern_data[k];
             }
             tmp_row[x] = sum;
         }
     }
+
+    // ===== HORIZONTAL PASS (optimized) =====
+    // Key insight: Use strided access to tmp, but process sequentially
     
-    // HORIZONTAL PASS with SIMD (similar structure)
-    #pragma omp parallel for schedule(guided)
-    for (int y = 0; y < img.height; y++) {
-        float* filt_row = filtered.data + y * img.width;
+    #pragma omp parallel for schedule(static)
+    for (int y = 0; y < height; y++) {
+        const float* tmp_row = tmp_data + y * width;
+        float* filt_row = filtered.data + y * width;
         
+        // Vectorized bulk processing
         int x = 0;
-        int vec_size = 8;
-        
-        for (; x <= img.width - vec_size; x += vec_size) {
+        for (; x <= width - vec_size; x += vec_size) {
             __m256 sum_vec = _mm256_setzero_ps();
             
             for (int k = 0; k < size; k++) {
                 int ix_base = x + (-center + k);
                 
-                // Load 8 consecutive values with boundary handling
+                // Clamp all 8 indices before loading
+                int ix[8];
+                #pragma omp simd
+                for (int v = 0; v < vec_size; v++) {
+                    int idx = ix_base + v;
+                    ix[v] = (idx < 0) ? 0 : (idx >= width ? width - 1 : idx);
+                }
+                
+                // Gather loads (or use conditional approach)
                 __m256 vals = _mm256_setr_ps(
-                    tmp.data[y * img.width + std::max(0, std::min(img.width-1, ix_base+0))],
-                    tmp.data[y * img.width + std::max(0, std::min(img.width-1, ix_base+1))],
-                    tmp.data[y * img.width + std::max(0, std::min(img.width-1, ix_base+2))],
-                    tmp.data[y * img.width + std::max(0, std::min(img.width-1, ix_base+3))],
-                    tmp.data[y * img.width + std::max(0, std::min(img.width-1, ix_base+4))],
-                    tmp.data[y * img.width + std::max(0, std::min(img.width-1, ix_base+5))],
-                    tmp.data[y * img.width + std::max(0, std::min(img.width-1, ix_base+6))],
-                    tmp.data[y * img.width + std::max(0, std::min(img.width-1, ix_base+7))]
+                    tmp_row[ix[0]], tmp_row[ix[1]], tmp_row[ix[2]], tmp_row[ix[3]],
+                    tmp_row[ix[4]], tmp_row[ix[5]], tmp_row[ix[6]], tmp_row[ix[7]]
                 );
                 
-                __m256 kern = _mm256_set1_ps(kernel.data[k]);
+                __m256 kern = _mm256_set1_ps(kern_data[k]);
                 sum_vec = _mm256_fmadd_ps(vals, kern, sum_vec);
             }
             
@@ -416,13 +429,13 @@ Image gaussian_blur(const Image& img, float sigma)
         }
         
         // Scalar remainder
-        for (; x < img.width; x++) {
-            float sum = 0;
+        for (; x < width; x++) {
+            float sum = 0.0f;
             for (int k = 0; k < size; k++) {
                 int ix = x + (-center + k);
                 if (ix < 0) ix = 0;
-                if (ix >= img.width) ix = img.width - 1;
-                sum += tmp.data[y * img.width + ix] * kernel.data[k];
+                if (ix >= width) ix = width - 1;
+                sum += tmp_row[ix] * kern_data[k];
             }
             filt_row[x] = sum;
         }
@@ -430,6 +443,117 @@ Image gaussian_blur(const Image& img, float sigma)
     
     return filtered;
 }
+
+//Image gaussian_blur(const Image& img, float sigma)
+//{
+//    assert(img.channels == 1);
+//    
+//    auto blur_start = std::chrono::high_resolution_clock::now();
+//
+//    int size = std::ceil(6 * sigma);
+//    if (size % 2 == 0)
+//        size++;
+//    int center = size / 2;
+//    
+//    Image kernel(size, 1, 1);
+//    float sum = 0;
+//    for (int k = -size/2; k <= size/2; k++) {
+//        float val = std::exp(-(k*k) / (2*sigma*sigma));
+//        kernel.set_pixel(center+k, 0, 0, val);
+//        sum += val;
+//    }
+//    for (int k = 0; k < size; k++)
+//        kernel.data[k] /= sum;
+//
+//    Image tmp(img.width, img.height, 1);
+//    Image filtered(img.width, img.height, 1);
+//
+//    // VERTICAL PASS with SIMD
+//    #pragma omp parallel for schedule(guided)
+//    for (int y = 0; y < img.height; y++) {
+//        float* tmp_row = tmp.data + y * img.width;
+//        
+//        int x = 0;
+//        int vec_size = 8;  // AVX2
+//        
+//        // Vectorized loop
+//        for (; x <= img.width - vec_size; x += vec_size) {
+//            __m256 sum_vec = _mm256_setzero_ps();
+//            
+//            for (int k = 0; k < size; k++) {
+//                int iy = y + (-center + k);
+//                if (iy < 0) iy = 0;
+//                if (iy >= img.height) iy = img.height - 1;
+//                
+//                __m256 vals = _mm256_loadu_ps(&img.data[iy * img.width + x]);
+//                __m256 kern = _mm256_set1_ps(kernel.data[k]);
+//                sum_vec = _mm256_fmadd_ps(vals, kern, sum_vec);
+//            }
+//            
+//            _mm256_storeu_ps(tmp_row + x, sum_vec);
+//        }
+//        
+//        // Scalar remainder
+//        for (; x < img.width; x++) {
+//            float sum = 0;
+//            for (int k = 0; k < size; k++) {
+//                int iy = y + (-center + k);
+//                if (iy < 0) iy = 0;
+//                if (iy >= img.height) iy = img.height - 1;
+//                sum += img.data[iy * img.width + x] * kernel.data[k];
+//            }
+//            tmp_row[x] = sum;
+//        }
+//    }
+//    
+//    // HORIZONTAL PASS with SIMD (similar structure)
+//    #pragma omp parallel for schedule(guided)
+//    for (int y = 0; y < img.height; y++) {
+//        float* filt_row = filtered.data + y * img.width;
+//        
+//        int x = 0;
+//        int vec_size = 8;
+//        
+//        for (; x <= img.width - vec_size; x += vec_size) {
+//            __m256 sum_vec = _mm256_setzero_ps();
+//            
+//            for (int k = 0; k < size; k++) {
+//                int ix_base = x + (-center + k);
+//                
+//                // Load 8 consecutive values with boundary handling
+//                __m256 vals = _mm256_setr_ps(
+//                    tmp.data[y * img.width + std::max(0, std::min(img.width-1, ix_base+0))],
+//                    tmp.data[y * img.width + std::max(0, std::min(img.width-1, ix_base+1))],
+//                    tmp.data[y * img.width + std::max(0, std::min(img.width-1, ix_base+2))],
+//                    tmp.data[y * img.width + std::max(0, std::min(img.width-1, ix_base+3))],
+//                    tmp.data[y * img.width + std::max(0, std::min(img.width-1, ix_base+4))],
+//                    tmp.data[y * img.width + std::max(0, std::min(img.width-1, ix_base+5))],
+//                    tmp.data[y * img.width + std::max(0, std::min(img.width-1, ix_base+6))],
+//                    tmp.data[y * img.width + std::max(0, std::min(img.width-1, ix_base+7))]
+//                );
+//                
+//                __m256 kern = _mm256_set1_ps(kernel.data[k]);
+//                sum_vec = _mm256_fmadd_ps(vals, kern, sum_vec);
+//            }
+//            
+//            _mm256_storeu_ps(filt_row + x, sum_vec);
+//        }
+//        
+//        // Scalar remainder
+//        for (; x < img.width; x++) {
+//            float sum = 0;
+//            for (int k = 0; k < size; k++) {
+//                int ix = x + (-center + k);
+//                if (ix < 0) ix = 0;
+//                if (ix >= img.width) ix = img.width - 1;
+//                sum += tmp.data[y * img.width + ix] * kernel.data[k];
+//            }
+//            filt_row[x] = sum;
+//        }
+//    }
+//    
+//    return filtered;
+//}
 
 
 void draw_point(Image& img, int x, int y, int size)

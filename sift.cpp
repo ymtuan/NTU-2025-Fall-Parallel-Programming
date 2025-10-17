@@ -119,6 +119,72 @@ ScaleSpacePyramid generate_dog_pyramid(const ScaleSpacePyramid& img_pyramid) {
     return dog_pyramid;
 }
 
+ScaleSpacePyramid generate_dog_pyramid_fused(const Image& input_img,
+                                             float sigma_min,
+                                             int num_octaves,
+                                             int scales_per_octave)
+{
+    // Step 1: Pre-compute ALL sigma values for the entire pyramid
+    float base_sigma = sigma_min / MIN_PIX_DIST;
+    Image base_img = input_img.resize(input_img.width*2, input_img.height*2, Interpolation::BILINEAR);
+    float sigma_diff = std::sqrt(base_sigma*base_sigma - 1.0f);
+    base_img = gaussian_blur(base_img, sigma_diff);
+    
+    int imgs_per_octave = scales_per_octave + 3;
+    float k = std::pow(2, 1.0/scales_per_octave);
+    
+    std::vector<float> sigma_vals {base_sigma};
+    for (int i = 1; i < imgs_per_octave; i++) {
+        float sigma_prev = base_sigma * std::pow(k, i-1);
+        float sigma_total = k * sigma_prev;
+        sigma_vals.push_back(std::sqrt(sigma_total*sigma_total - sigma_prev*sigma_prev));
+    }
+    
+    // Step 2: Build DoG pyramid directly (fused blur + subtract)
+    ScaleSpacePyramid dog_pyramid = {
+        num_octaves,
+        imgs_per_octave - 1,
+        std::vector<std::vector<Image>>(num_octaves)
+    };
+    
+    Image prev_gaussian = std::move(base_img);
+    
+    for (int octave = 0; octave < num_octaves; octave++) {
+        dog_pyramid.octaves[octave].reserve(imgs_per_octave - 1);
+        
+        for (int scale = 1; scale < imgs_per_octave; scale++) {
+            // FUSED OPERATION: Blur + Subtract in single pass
+            Image curr_gaussian = gaussian_blur(prev_gaussian, sigma_vals[scale]);
+            
+            // Compute DoG directly while curr_gaussian is hot in cache
+            Image dog(curr_gaussian.width, curr_gaussian.height, 1);
+            
+            int width = curr_gaussian.width;
+            int height = curr_gaussian.height;
+            const float* curr_data = curr_gaussian.data;
+            const float* prev_data = prev_gaussian.data;
+            float* dog_data = dog.data;
+            
+            #pragma omp parallel for schedule(static)
+            for (int i = 0; i < width * height; i++) {
+                dog_data[i] = curr_data[i] - prev_data[i];
+            }
+            
+            dog_pyramid.octaves[octave].push_back(dog);
+            prev_gaussian = std::move(curr_gaussian);  // Move semantics: no copy
+        }
+        
+        // Prepare for next octave
+        if (octave < num_octaves - 1) {
+            prev_gaussian = prev_gaussian.resize(prev_gaussian.width/2, 
+                                                 prev_gaussian.height/2,
+                                                 Interpolation::NEAREST);
+        }
+    }
+    
+    return dog_pyramid;
+}
+
 bool point_is_extremum(const std::vector<Image>& octave, int scale, int x, int y)
 {
     const Image& img = octave[scale];
@@ -257,6 +323,100 @@ bool refine_or_discard_keypoint(Keypoint& kp, const std::vector<Image>& octave,
     return kp_is_valid;
 }
 
+//std::vector<Keypoint> find_keypoints(const ScaleSpacePyramid& dog_pyramid, 
+//                                     int start_octave, int end_octave, 
+//                                     float contrast_thresh,
+//                                     float edge_thresh)
+//{
+//    std::vector<Keypoint> keypoints;
+//    std::vector<std::vector<Keypoint>> thread_keypoints;
+//    
+//    #pragma omp parallel
+//    {
+//        #pragma omp single
+//        {
+//            thread_keypoints.resize(omp_get_num_threads());
+//        }
+//        
+//        #pragma omp for collapse(2) schedule(dynamic)
+//        for (int i = start_octave; i < end_octave; i++) {
+//            for (int j = 1; j < dog_pyramid.imgs_per_octave-1; j++) {
+//                const std::vector<Image>& octave = dog_pyramid.octaves[i];
+//                const Image& img = octave[j];
+//                for (int x = 1; x < img.width-1; x++) {
+//                    for (int y = 1; y < img.height-1; y++) {
+//                        if (std::abs(img.get_pixel(x, y, 0)) < 0.8 * contrast_thresh) {
+//                            continue;
+//                        }
+//                        if (point_is_extremum(octave, j, x, y)) {
+//                            Keypoint kp = {x, y, i, j, -1, -1, -1, -1};
+//                            bool kp_is_valid = refine_or_discard_keypoint(kp, octave, contrast_thresh,
+//                                                                          edge_thresh);
+//                            if (kp_is_valid) {
+//                                thread_keypoints[omp_get_thread_num()].push_back(kp);
+//                            }
+//                        }
+//                    }
+//                }
+//            }
+//        }
+//    }
+//    
+//    for (const auto& vec : thread_keypoints) {
+//        keypoints.insert(keypoints.end(), vec.begin(), vec.end());
+//    }
+//    
+//    return keypoints;
+//}
+
+// NEW: Fast extremum check using direct pointers (avoids get_pixel() calls)
+inline bool point_is_extremum_fast(const float* img, const float* prev, const float* next,
+                                   int x, int y, int width, float center_val)
+{
+    bool is_min = true, is_max = true;
+    
+    // Check 26 neighbors using direct pointer arithmetic
+    int row_offset = y * width;
+    int prev_row_offset = (y - 1) * width;
+    int next_row_offset = (y + 1) * width;
+    
+    // Previous scale plane (3กั3 neighbors)
+    for (int dy = -1; dy <= 1; dy++) {
+        int prow = (y + dy) * width;
+        for (int dx = -1; dx <= 1; dx++) {
+            float neighbor = prev[prow + x + dx];
+            if (neighbor > center_val) is_max = false;
+            if (neighbor < center_val) is_min = false;
+            if (!is_min && !is_max) return false;
+        }
+    }
+    
+    // Current scale plane (8 neighbors)
+    for (int dy = -1; dy <= 1; dy++) {
+        int crow = (y + dy) * width;
+        for (int dx = -1; dx <= 1; dx++) {
+            if (dx == 0 && dy == 0) continue;  // Skip center
+            float neighbor = img[crow + x + dx];
+            if (neighbor > center_val) is_max = false;
+            if (neighbor < center_val) is_min = false;
+            if (!is_min && !is_max) return false;
+        }
+    }
+    
+    // Next scale plane (3กั3 neighbors)
+    for (int dy = -1; dy <= 1; dy++) {
+        int nrow = (y + dy) * width;
+        for (int dx = -1; dx <= 1; dx++) {
+            float neighbor = next[nrow + x + dx];
+            if (neighbor > center_val) is_max = false;
+            if (neighbor < center_val) is_min = false;
+            if (!is_min && !is_max) return false;
+        }
+    }
+    
+    return true;
+}
+
 std::vector<Keypoint> find_keypoints(const ScaleSpacePyramid& dog_pyramid, 
                                      int start_octave, int end_octave, 
                                      float contrast_thresh,
@@ -272,22 +432,45 @@ std::vector<Keypoint> find_keypoints(const ScaleSpacePyramid& dog_pyramid,
             thread_keypoints.resize(omp_get_num_threads());
         }
         
+        // CHANGED: Y-outer, X-inner (row-major order)
         #pragma omp for collapse(2) schedule(dynamic)
         for (int i = start_octave; i < end_octave; i++) {
             for (int j = 1; j < dog_pyramid.imgs_per_octave-1; j++) {
                 const std::vector<Image>& octave = dog_pyramid.octaves[i];
                 const Image& img = octave[j];
-                for (int x = 1; x < img.width-1; x++) {
-                    for (int y = 1; y < img.height-1; y++) {
-                        if (std::abs(img.get_pixel(x, y, 0)) < 0.8 * contrast_thresh) {
+                const Image& prev = octave[j-1];
+                const Image& next = octave[j+1];
+                
+                int width = img.width;
+                int height = img.height;
+                const float* img_data = img.data;
+                const float* prev_data = prev.data;
+                const float* next_data = next.data;
+                
+                float contrast_check_thresh = 0.8f * contrast_thresh;
+                int thread_id = omp_get_thread_num();
+                
+                // CHANGED: Y-OUTER for sequential memory access
+                for (int y = 1; y < height - 1; y++) {
+                    int row_offset = y * width;
+                    
+                    for (int x = 1; x < width - 1; x++) {
+                        int idx = row_offset + x;
+                        float center_val = img_data[idx];
+                        
+                        // Quick rejection: contrast check
+                        if (std::abs(center_val) < contrast_check_thresh) {
                             continue;
                         }
-                        if (point_is_extremum(octave, j, x, y)) {
+                        
+                        // Check if extremum (only if contrast passes)
+                        if (point_is_extremum_fast(img_data, prev_data, next_data,
+                                                   x, y, width, center_val)) {
                             Keypoint kp = {x, y, i, j, -1, -1, -1, -1};
-                            bool kp_is_valid = refine_or_discard_keypoint(kp, octave, contrast_thresh,
-                                                                          edge_thresh);
+                            bool kp_is_valid = refine_or_discard_keypoint(kp, octave, 
+                                                                          contrast_thresh, edge_thresh);
                             if (kp_is_valid) {
-                                thread_keypoints[omp_get_thread_num()].push_back(kp);
+                                thread_keypoints[thread_id].push_back(kp);
                             }
                         }
                     }
@@ -304,6 +487,66 @@ std::vector<Keypoint> find_keypoints(const ScaleSpacePyramid& dog_pyramid,
 }
 
 // calculate x and y derivatives for all images in the input pyramid
+//ScaleSpacePyramid generate_gradient_pyramid(const ScaleSpacePyramid& pyramid)
+//{
+//    ScaleSpacePyramid grad_pyramid = {
+//        pyramid.num_octaves,
+//        pyramid.imgs_per_octave,
+//        std::vector<std::vector<Image>>(pyramid.num_octaves)
+//    };
+//    for (int i = 0; i < pyramid.num_octaves; i++) {
+//        grad_pyramid.octaves[i].reserve(grad_pyramid.imgs_per_octave);
+//        int width = pyramid.octaves[i][0].width;
+//        int height = pyramid.octaves[i][0].height;
+//        for (int j = 0; j < pyramid.imgs_per_octave; j++) {
+//            Image grad(width, height, 2);
+////            #pragma omp parallel for schedule(static)
+////            for (int y = 1; y < grad.height-1; y++) {
+////              for (int x = 1; x < grad.width-1; x++) {
+////                    float gx = (pyramid.octaves[i][j].get_pixel(x+1, y, 0)
+////                         -pyramid.octaves[i][j].get_pixel(x-1, y, 0)) * 0.5;
+////                    grad.set_pixel(x, y, 0, gx);
+////                    float gy = (pyramid.octaves[i][j].get_pixel(x, y+1, 0)
+////                         -pyramid.octaves[i][j].get_pixel(x, y-1, 0)) * 0.5;
+////                    grad.set_pixel(x, y, 1, gy);
+////                }
+////            }
+//            #pragma omp parallel for schedule(static)
+//            for (int y = 1; y < grad.height - 1; y++) {
+//                const float* row_m1 = &pyramid.octaves[i][j].data[(y - 1) * width];
+//                const float* row = &pyramid.octaves[i][j].data[y * width];
+//                const float* row_p1 = &pyramid.octaves[i][j].data[(y + 1) * width];
+//                float* gx_row = &grad.data[y * width];      // ch0 starts at 0
+//                float* gy_row = &grad.data[grad.size / 2 + y * width];  // ch1 at size/2
+//            
+//                __m256 half = _mm256_set1_ps(0.5f);
+//                int vec_size = 8;
+//                for (int x = 1; x < grad.width - 1 - vec_size + 1; x += vec_size) {
+//                    __m256 left = _mm256_loadu_ps(&row[x - 1]);
+//                    __m256 right = _mm256_loadu_ps(&row[x + 1]);
+//                    __m256 gx_vec = _mm256_mul_ps(_mm256_sub_ps(right, left), half);
+//                    _mm256_storeu_ps(&gx_row[x], gx_vec);
+//            
+//                    __m256 up = _mm256_loadu_ps(&row_m1[x]);
+//                    __m256 down = _mm256_loadu_ps(&row_p1[x]);
+//                    __m256 gy_vec = _mm256_mul_ps(_mm256_sub_ps(down, up), half);
+//                    _mm256_storeu_ps(&gy_row[x], gy_vec);
+//                }
+//                // Scalar remainder
+//                for (int x = ((grad.width - 2) / vec_size) * vec_size + 1; x < grad.width - 1; x++) {
+//                    float gx = (row[x + 1] - row[x - 1]) * 0.5f;
+//                    gx_row[x] = gx;
+//                    float gy = (row_p1[x] - row_m1[x]) * 0.5f;
+//                    gy_row[x] = gy;
+//                }
+//            }
+//                        
+//            grad_pyramid.octaves[i].push_back(grad);
+//        }
+//    }
+//    return grad_pyramid;
+//}
+
 ScaleSpacePyramid generate_gradient_pyramid(const ScaleSpacePyramid& pyramid)
 {
     ScaleSpacePyramid grad_pyramid = {
@@ -311,58 +554,68 @@ ScaleSpacePyramid generate_gradient_pyramid(const ScaleSpacePyramid& pyramid)
         pyramid.imgs_per_octave,
         std::vector<std::vector<Image>>(pyramid.num_octaves)
     };
+    
     for (int i = 0; i < pyramid.num_octaves; i++) {
         grad_pyramid.octaves[i].reserve(grad_pyramid.imgs_per_octave);
         int width = pyramid.octaves[i][0].width;
         int height = pyramid.octaves[i][0].height;
+        
         for (int j = 0; j < pyramid.imgs_per_octave; j++) {
             Image grad(width, height, 2);
-//            #pragma omp parallel for schedule(static)
-//            for (int y = 1; y < grad.height-1; y++) {
-//              for (int x = 1; x < grad.width-1; x++) {
-//                    float gx = (pyramid.octaves[i][j].get_pixel(x+1, y, 0)
-//                         -pyramid.octaves[i][j].get_pixel(x-1, y, 0)) * 0.5;
-//                    grad.set_pixel(x, y, 0, gx);
-//                    float gy = (pyramid.octaves[i][j].get_pixel(x, y+1, 0)
-//                         -pyramid.octaves[i][j].get_pixel(x, y-1, 0)) * 0.5;
-//                    grad.set_pixel(x, y, 1, gy);
-//                }
-//            }
-            #pragma omp parallel for schedule(static)
-            for (int y = 1; y < grad.height - 1; y++) {
-                const float* row_m1 = &pyramid.octaves[i][j].data[(y - 1) * width];
-                const float* row = &pyramid.octaves[i][j].data[y * width];
-                const float* row_p1 = &pyramid.octaves[i][j].data[(y + 1) * width];
-                float* gx_row = &grad.data[y * width];      // ch0 starts at 0
-                float* gy_row = &grad.data[grad.size / 2 + y * width];  // ch1 at size/2
             
-                __m256 half = _mm256_set1_ps(0.5f);
-                int vec_size = 8;
-                for (int x = 1; x < grad.width - 1 - vec_size + 1; x += vec_size) {
+            const float* src = pyramid.octaves[i][j].data;
+            float* gx_out = grad.data;
+            float* gy_out = grad.data + width * height;
+            
+            const __m256 half = _mm256_set1_ps(0.5f);
+            const int vec_size = 8;
+            
+            // Row-wise processing for cache efficiency
+            #pragma omp parallel for schedule(static)
+            for (int y = 1; y < height - 1; y++) {
+                const float* row_m1 = &src[(y - 1) * width];
+                const float* row = &src[y * width];
+                const float* row_p1 = &src[(y + 1) * width];
+                
+                float* gx_row = &gx_out[y * width];
+                float* gy_row = &gy_out[y * width];
+                
+                // Vectorized main loop (no boundary checks)
+                for (int x = 1; x < width - 1 - vec_size; x += vec_size) {
+                    // GX computation
                     __m256 left = _mm256_loadu_ps(&row[x - 1]);
                     __m256 right = _mm256_loadu_ps(&row[x + 1]);
                     __m256 gx_vec = _mm256_mul_ps(_mm256_sub_ps(right, left), half);
                     _mm256_storeu_ps(&gx_row[x], gx_vec);
-            
+                    
+                    // GY computation
                     __m256 up = _mm256_loadu_ps(&row_m1[x]);
                     __m256 down = _mm256_loadu_ps(&row_p1[x]);
                     __m256 gy_vec = _mm256_mul_ps(_mm256_sub_ps(down, up), half);
                     _mm256_storeu_ps(&gy_row[x], gy_vec);
                 }
-                // Scalar remainder
-                for (int x = ((grad.width - 2) / vec_size) * vec_size + 1; x < grad.width - 1; x++) {
-                    float gx = (row[x + 1] - row[x - 1]) * 0.5f;
-                    gx_row[x] = gx;
-                    float gy = (row_p1[x] - row_m1[x]) * 0.5f;
-                    gy_row[x] = gy;
+                
+                // Scalar edges (only 7 pixels per row)
+                for (int x = width - 1 - ((width - 2) % vec_size); x < width - 1; x++) {
+                    gx_row[x] = (row[x + 1] - row[x - 1]) * 0.5f;
+                    gy_row[x] = (row_p1[x] - row_m1[x]) * 0.5f;
                 }
             }
-                        
+            
+            // Handle boundary rows (y=0 and y=height-1)
+            for (int x = 1; x < width - 1; x++) {
+                gx_out[0 * width + x] = 0.0f;
+                gy_out[0 * width + x] = 0.0f;
+                gx_out[(height-1) * width + x] = 0.0f;
+                gy_out[(height-1) * width + x] = 0.0f;
+            }
+            
             grad_pyramid.octaves[i].push_back(grad);
         }
     }
     return grad_pyramid;
 }
+
 
 // convolve 6x with box filter
 void smooth_histogram(float hist[N_BINS])
@@ -469,6 +722,7 @@ void update_histograms(float hist[N_HIST][N_HIST][N_ORI], float x, float y,
     }
 }
 
+
 void hists_to_vec(float histograms[N_HIST][N_HIST][N_ORI], std::array<uint8_t, 128>& feature_vec)
 {
     int size = N_HIST*N_HIST*N_ORI;
@@ -506,8 +760,11 @@ void compute_keypoint_descriptor(Keypoint& kp, float theta,
     int y_start = std::round((kp.y-half_size) / pix_dist);
     int y_end = std::round((kp.y+half_size) / pix_dist);
 
-    float cos_t = std::cos(theta), sin_t = std::sin(theta);
+    // Precompute transcendental function once
+    float cos_t = std::cos(theta);
+    float sin_t = std::sin(theta);
     float patch_sigma = lambda_desc * kp.sigma;
+    
     //accumulate samples into histograms
     for (int m = x_start; m <= x_end; m++) {
         for (int n = y_start; n <= y_end; n++) {
@@ -523,6 +780,7 @@ void compute_keypoint_descriptor(Keypoint& kp, float theta,
 
             float gx = img_grad.get_pixel(m, n, 0), gy = img_grad.get_pixel(m, n, 1);
             float theta_mn = std::fmod(std::atan2(gy, gx)-theta+4*M_PI, 2*M_PI);
+            
             float grad_norm = std::sqrt(gx*gx + gy*gy);
             float weight = std::exp(-(std::pow(m*pix_dist-kp.x, 2)+std::pow(n*pix_dist-kp.y, 2))
                                     /(2*patch_sigma*patch_sigma));
@@ -535,7 +793,6 @@ void compute_keypoint_descriptor(Keypoint& kp, float theta,
     // build feature vector (descriptor) from histograms
     hists_to_vec(histograms, kp.descriptor);
 }
-
 
 
 // ---------------------------------------------------
@@ -561,67 +818,127 @@ long long compute_octave_work(int octave_idx, int base_width, int base_height,
     return width * height * scales_per_octave;
 }
 
+//LoadBalanceAssignment compute_load_balance(int world_size, 
+//                                           int num_octaves, 
+//                                           int img_width, int img_height,
+//                                           int scales_per_octave)
+//{
+//    // Step 1: Calculate work for each octave
+//    std::vector<long long> octave_work(num_octaves);
+//    long long total_work = 0;
+//    
+//    for (int i = 0; i < num_octaves; i++) {
+//        octave_work[i] = compute_octave_work(i, img_width, img_height, scales_per_octave);
+//        total_work += octave_work[i];
+//    }
+//    
+//    // Step 2: Use greedy algorithm to assign octaves to processes
+//    std::vector<long long> process_work(world_size, 0);
+//    std::vector<int> octave_to_process(num_octaves);
+//    
+//    for (int octave = 0; octave < num_octaves; octave++) {
+//        // Find process with minimum current work
+//        int min_process = 0;
+//        long long min_work = process_work[0];
+//        
+//        for (int p = 1; p < world_size; p++) {
+//            if (process_work[p] < min_work) {
+//                min_work = process_work[p];
+//                min_process = p;
+//            }
+//        }
+//        
+//        // Assign this octave to least-loaded process
+//        octave_to_process[octave] = min_process;
+//        process_work[min_process] += octave_work[octave];
+//    }
+//    
+//    // Step 3: Convert to contiguous ranges for each process
+//    LoadBalanceAssignment assignment;
+//    assignment.start_octaves.resize(world_size);
+//    assignment.end_octaves.resize(world_size);
+//    
+//    std::vector<int> first_octave(world_size, num_octaves);  // Initialize to "none"
+//    std::vector<int> last_octave(world_size, -1);            // Initialize to "none"
+//    
+//    for (int octave = 0; octave < num_octaves; octave++) {
+//        int proc = octave_to_process[octave];
+//        if (octave < first_octave[proc]) {
+//            first_octave[proc] = octave;
+//        }
+//        if (octave > last_octave[proc]) {
+//            last_octave[proc] = octave;
+//        }
+//    }
+//    
+//    for (int p = 0; p < world_size; p++) {
+//        if (first_octave[p] == num_octaves) {
+//            // This process got no octaves
+//            assignment.start_octaves[p] = 0;
+//            assignment.end_octaves[p] = 0;
+//        } else {
+//            assignment.start_octaves[p] = first_octave[p];
+//            assignment.end_octaves[p] = last_octave[p] + 1;
+//        }
+//    }
+//    
+//    return assignment;
+//}
+
 LoadBalanceAssignment compute_load_balance(int world_size, 
-                                           int num_octaves, 
-                                           int img_width, int img_height,
-                                           int scales_per_octave)
+                                                     int num_octaves, 
+                                                     int img_width, int img_height,
+                                                     int scales_per_octave)
 {
-    // Step 1: Calculate work for each octave
+    // Calculate work for each octave
     std::vector<long long> octave_work(num_octaves);
     long long total_work = 0;
     
     for (int i = 0; i < num_octaves; i++) {
-        octave_work[i] = compute_octave_work(i, img_width, img_height, scales_per_octave);
+        long long width = img_width >> i;   // Divide by 2^i
+        long long height = img_height >> i;
+        octave_work[i] = width * height * scales_per_octave;
         total_work += octave_work[i];
     }
     
-    // Step 2: Use greedy algorithm to assign octaves to processes
+    // Use greedy assignment to minimize max workload (not average)
     std::vector<long long> process_work(world_size, 0);
-    std::vector<int> octave_to_process(num_octaves);
+    std::vector<std::vector<int>> process_octaves(world_size);
     
-    for (int octave = 0; octave < num_octaves; octave++) {
+    // Assign octaves in decreasing work order
+    std::vector<std::pair<long long, int>> work_idx;
+    for (int i = 0; i < num_octaves; i++) {
+        work_idx.push_back({octave_work[i], i});
+    }
+    std::sort(work_idx.rbegin(), work_idx.rend());  // Sort descending
+    
+    for (auto [work, octave] : work_idx) {
         // Find process with minimum current work
-        int min_process = 0;
-        long long min_work = process_work[0];
-        
+        int min_proc = 0;
         for (int p = 1; p < world_size; p++) {
-            if (process_work[p] < min_work) {
-                min_work = process_work[p];
-                min_process = p;
+            if (process_work[p] < process_work[min_proc]) {
+                min_proc = p;
             }
         }
         
-        // Assign this octave to least-loaded process
-        octave_to_process[octave] = min_process;
-        process_work[min_process] += octave_work[octave];
+        process_octaves[min_proc].push_back(octave);
+        process_work[min_proc] += work;
     }
     
-    // Step 3: Convert to contiguous ranges for each process
+    // Create contiguous ranges
     LoadBalanceAssignment assignment;
     assignment.start_octaves.resize(world_size);
     assignment.end_octaves.resize(world_size);
     
-    std::vector<int> first_octave(world_size, num_octaves);  // Initialize to "none"
-    std::vector<int> last_octave(world_size, -1);            // Initialize to "none"
-    
-    for (int octave = 0; octave < num_octaves; octave++) {
-        int proc = octave_to_process[octave];
-        if (octave < first_octave[proc]) {
-            first_octave[proc] = octave;
-        }
-        if (octave > last_octave[proc]) {
-            last_octave[proc] = octave;
-        }
-    }
-    
     for (int p = 0; p < world_size; p++) {
-        if (first_octave[p] == num_octaves) {
-            // This process got no octaves
+        if (process_octaves[p].empty()) {
             assignment.start_octaves[p] = 0;
             assignment.end_octaves[p] = 0;
         } else {
-            assignment.start_octaves[p] = first_octave[p];
-            assignment.end_octaves[p] = last_octave[p] + 1;
+            int min_oct = *std::min_element(process_octaves[p].begin(), process_octaves[p].end());
+            int max_oct = *std::max_element(process_octaves[p].begin(), process_octaves[p].end());
+            assignment.start_octaves[p] = min_oct;
+            assignment.end_octaves[p] = max_oct + 1;
         }
     }
     
@@ -791,6 +1108,10 @@ std::vector<Keypoint> find_keypoints_and_descriptors(const Image& img,
     // --- Difference of Gaussians (DoG) Pyramid ---
     start_step = std::chrono::high_resolution_clock::now();
     ScaleSpacePyramid dog_pyramid = generate_dog_pyramid(gaussian_pyramid);
+    // NEW SIGNATURE (fused operation)
+    //ScaleSpacePyramid dog_pyramid = generate_dog_pyramid_fused(input, sigma_min, num_octaves, scales_per_octave);
+    
+    
     MPI_Barrier(MPI_COMM_WORLD);
     end_step = std::chrono::high_resolution_clock::now();
     if (rank == 0) {
