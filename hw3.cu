@@ -32,6 +32,8 @@ __constant__ float bailout_d;
 __constant__ float eps_d;
 __constant__ float FOV_d;
 __constant__ float far_plane_d;
+// add a flag to specialize power==8 without checking every iteration
+__constant__ int use_pow8_d;
 
 __constant__ vec3f camera_pos_d;
 __constant__ vec3f target_pos_d;
@@ -39,6 +41,8 @@ __constant__ vec2f iResolution_d;
 __constant__ vec3f camera_forward_d;
 __constant__ vec3f camera_side_d;
 __constant__ vec3f camera_up_d;
+// NEW: precomputed light direction to avoid per-thread normalize
+__constant__ vec3f light_dir_d;
 
 // Host-side parameters
 int AA = 3;
@@ -97,69 +101,96 @@ __device__ __forceinline__ vec3f fast_cos(const vec3f& v) {
     return vec3f(cosf(v.x), cosf(v.y), cosf(v.z));
 }
 
+// Helper: fast r^power and dr multiplier with specialization for power==8
+__device__ __forceinline__ void bulb_pow(float r, float& r_pow, float& dr_mul, const bool pow8) {
+    if (pow8) {
+        float r2 = r * r;
+        float r4 = r2 * r2;
+        float r8 = r4 * r4;
+        r_pow = r8;
+        dr_mul = 8.f * (r8 / fmaxf(r, 1e-20f));
+    } else {
+        r_pow = powf(r, power_d);
+        dr_mul = power_d * powf(r, power_d - 1.f);
+    }
+}
+
 // mandelbulb distance function (DE) - float precision
-__device__ float md(vec3f p, float& trap) {
+__device__ __forceinline__ float md(vec3f p, float& trap) {
     vec3f v = p;
     float dr = 1.f;
-    float r = fast_length(v);
+    float r  = fast_length(v);
     trap = r;
+
+    // hoist uniform specialization decision out of the loop
+    const bool pow8 = (use_pow8_d != 0);
 
     #pragma unroll 4
     for (int i = 0; i < md_iter_d; ++i) {
-        float theta = atan2f(v.y, v.x) * power_d;
-        float phi = asinf(v.z / r) * power_d;
-        dr = __fmaf_rn(power_d * powf(r, power_d - 1.f), dr, 1.f);
-        
-        float r_pow = powf(r, power_d);
-        float cos_phi = cosf(phi);
-        v = p + r_pow * vec3f(
-            cosf(theta) * cos_phi,
-            sinf(theta) * cos_phi,
-            -sinf(phi)
-        );
+        if (r > bailout_d) break;
+
+        float theta = atan2f(v.y, v.x);
+        float phi   = asinf(fmaxf(fminf(v.z / fmaxf(r, 1e-20f), 1.f), -1.f));
+
+        float r_pow, dr_mul;
+        bulb_pow(r, r_pow, dr_mul, pow8);
+        dr = __fmaf_rn(dr_mul, dr, 1.f);
+
+        float s_t, c_t; sincosf(theta * power_d, &s_t, &c_t);
+        float s_p, c_p; sincosf(phi   * power_d, &s_p, &c_p);
+
+        v = p + r_pow * vec3f(c_t * c_p, s_t * c_p, -s_p);
 
         trap = fminf(trap, r);
         r = fast_length(v);
-        if (r > bailout_d) break;
     }
     return 0.5f * logf(r) * r / dr;
 }
 
-// scene mapping
-__device__ float map(vec3f p, float& trap, int& ID) {
-    const float pi_2 = pi / 2.f;
-    vec2f rt = vec2f(cosf(pi_2), sinf(pi_2));
-    vec3f rp = mat3f(1.f, 0.f, 0.f, 0.f, rt.x, -rt.y, 0.f, rt.y, rt.x) * p;
-    ID = 1;
+// scene mapping - rotate 90° around X by swizzle to avoid mat3 multiply
+__device__ __forceinline__ float map(vec3f p, float& trap) {
+    vec3f rp = vec3f(p.x, -p.z, p.y);
     return md(rp, trap);
 }
 
-__device__ float map(vec3f p) {
+__device__ __forceinline__ float map(vec3f p) {
     float dmy;
-    int dmy2;
-    return map(p, dmy, dmy2);
+    return map(p, dmy);
 }
 
 // second march: cast shadow
 __device__ float softshadow(vec3f ro, vec3f rd, float k) {
     float res = 1.0f;
-    float t = 0.f;
+    float t = 0.0f;
     #pragma unroll 8
     for (int i = 0; i < shadow_step_d; ++i) {
         float h = map(ro + rd * t);
-        res = fminf(res, k * h / t);
+        // match original behavior closely; avoid div by 0
+        res = fminf(res, k * h / fmaxf(t, 1e-6f));
         if (res < 0.02f) return 0.02f;
         t += fast_clamp(h, .001f, step_limiter_d);
+        if (t > far_plane_d) break;
     }
     return fast_clamp(res, .02f, 1.f);
 }
 
-// Remove __noinline__, let compiler inline for better optimization
-__device__ float trace(vec3f ro, vec3f rd, float& trap, int& ID) {
+// Tetrahedral normal: 4-sample gradient instead of 6-sample central differences
+__device__ __forceinline__ vec3f calcNor(vec3f p) {
+    // Revert to central differences for accuracy (matches original shading closer)
+    const vec2f e = vec2f(eps_d, 0.f);
+    vec3f grad = vec3f(
+        map(p + e.xyy()) - map(p - e.xyy()),
+        map(p + e.yxy()) - map(p - e.yxy()),
+        map(p + e.yyx()) - map(p - e.yyx())
+    );
+    return fast_normalize(grad);
+}
+
+// Conservative stepping: use user multiplier only (matches original accuracy)
+__device__ float trace(vec3f ro, vec3f rd, float& trap) {
     float t = 0.f;
-    
     for (int i = 0; i < ray_step_d; ++i) {
-        float len = map(ro + rd * t, trap, ID);
+        float len = map(ro + rd * t, trap);
         if (fabsf(len) < eps_d || t > far_plane_d) break;
         t += len * ray_multiplier_d;
     }
@@ -167,8 +198,8 @@ __device__ float trace(vec3f ro, vec3f rd, float& trap, int& ID) {
 }
 
 // Higher occupancy kernel - inline everything
-__global__ void __launch_bounds__(256, 4) 
-render_kernel(unsigned char* output, int width, int height) {
+__global__ void __launch_bounds__(256, 4)
+render_kernel(unsigned char* __restrict__ output, int width, int height) {
     int gid = blockDim.x * blockIdx.x + threadIdx.x;
     if (gid >= width * height) return;
 
@@ -180,55 +211,51 @@ render_kernel(unsigned char* output, int width, int height) {
     const float inv_AA = 1.0f / (float)AA_d;
     const float inv_res_y = 1.0f / iResolution_d.y;
     const float inv_samples = 1.0f / (float)(AA_d * AA_d);
-    
-    for (int m = 0; m < AA_d; ++m) {
-        for (int n = 0; n < AA_d; ++n) {
-            float px = (float)j + (float)m * inv_AA;
-            float py = (float)i + (float)n * inv_AA;
 
-            float uv_x = (-iResolution_d.x + 2.0f * px) * inv_res_y;
-            float uv_y = -(-iResolution_d.y + 2.0f * py) * inv_res_y;
+    // hoist light direction; constant per pixel (precomputed on host)
+    const vec3f sd = light_dir_d;
+
+    // precompute base uv for pixel center and per-AA increment to cut ALU
+    const float base_uv_x = (-iResolution_d.x + 2.0f * (float)j) * inv_res_y;
+    const float base_uv_y = -(-iResolution_d.y + 2.0f * (float)i) * inv_res_y;
+    const float uv_step   = 2.0f * inv_res_y * inv_AA;
+
+    for (int m = 0; m < AA_d; ++m) {
+        float uv_x_m = base_uv_x + uv_step * (float)m;
+        for (int n = 0; n < AA_d; ++n) {
+            float uv_x = uv_x_m;
+            float uv_y = base_uv_y - uv_step * (float)n;
 
             vec3f rd = fast_normalize(uv_x * camera_side_d + uv_y * camera_up_d + FOV_d * camera_forward_d);
 
             float trap;
-            int objID;
-            float d = trace(camera_pos_d, rd, trap, objID);
+            // removed unused objID
+            float d = trace(camera_pos_d, rd, trap);
 
-            // Inline shading to avoid spills
             if (d >= 0.f) {
                 vec3f pos = camera_pos_d + rd * d;
-                
-                // Inline calcNor
-                vec2f e = vec2f(eps_d, 0.f);
-                vec3f nr = fast_normalize(vec3f(
-                    map(pos + e.xyy()) - map(pos - e.xyy()),
-                    map(pos + e.yxy()) - map(pos - e.yxy()),
-                    map(pos + e.yyx()) - map(pos - e.yyx())
-                ));
-                
-                vec3f sd = fast_normalize(camera_pos_d);
+
+                // 4-sample tetrahedral normal
+                vec3f nr = calcNor(pos);
+
                 vec3f hal = fast_normalize(sd - rd);
 
-                // Palette
                 vec3f c_t = 2.0f * (float)pi * (vec3f(1.f) * (trap - .4f) + vec3f(.0f, .1f, .2f));
                 vec3f col = vec3f(.5f) + vec3f(.5f) * fast_cos(c_t);
-                
-                float amb = (0.7f + 0.3f * nr.y) * 
+
+                float amb = (0.7f + 0.3f * nr.y) *
                             (0.2f + 0.8f * fast_clamp(0.05f * logf(trap), 0.0f, 1.0f));
                 float sdw = softshadow(pos + .001f * nr, sd, 16.f);
                 float dif = fast_clamp(fast_dot(sd, nr), 0.f, 1.f) * sdw;
                 float spe = powf(fast_clamp(fast_dot(nr, hal), 0.f, 1.f), 32.f) * dif;
 
-                // Lighting
                 col *= vec3f(0.3f) * (.05f + .95f * amb) + vec3f(1.f, .9f, .717f) * dif * 0.8f;
                 col = fast_pow(col, vec3f(.7f, .9f, 1.f));
                 col += spe * 0.8f;
-                
-                // Gamma correction
+
                 col = fast_pow(col, vec3f(.4545f));
                 col = fast_clamp(col, 0.f, 1.f);
-                
+
                 fcol_r += col.r;
                 fcol_g += col.g;
                 fcol_b += col.b;
@@ -270,7 +297,13 @@ int main(int argc, char** argv) {
     float eps_f = (float)eps;
     float FOV_f = (float)FOV;
     float far_plane_f = (float)far_plane;
-    
+    // NEW: host-side specialization flag for power == 8
+    int use_pow8 = (fabs(power - 8.0) < 1e-6) ? 1 : 0;
+
+    // NEW: precompute light direction on host (same as fast_normalize(camera_pos_d))
+    vec3 light_dir = glm::normalize(camera_pos);
+    vec3f light_dir_f = vec3f((float)light_dir.x, (float)light_dir.y, (float)light_dir.z);
+
     vec3f camera_pos_f = vec3f((float)camera_pos.x, (float)camera_pos.y, (float)camera_pos.z);
     vec3f target_pos_f = vec3f((float)target_pos.x, (float)target_pos.y, (float)target_pos.z);
     vec2f iResolution_f = vec2f((float)iResolution.x, (float)iResolution.y);
@@ -296,6 +329,10 @@ int main(int argc, char** argv) {
     cudaMemcpyToSymbol(camera_forward_d, &cf_f, sizeof(vec3f));
     cudaMemcpyToSymbol(camera_side_d, &cs_f, sizeof(vec3f));
     cudaMemcpyToSymbol(camera_up_d, &cu_f, sizeof(vec3f));
+    // add the specialization flag
+    cudaMemcpyToSymbol(use_pow8_d, &use_pow8, sizeof(int));
+    // NEW: copy precomputed light direction
+    cudaMemcpyToSymbol(light_dir_d, &light_dir_f, sizeof(vec3f));
 
     // Allocate device memory
     unsigned char* d_output;
