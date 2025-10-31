@@ -3,11 +3,14 @@
 #include <cstdio>
 #include <cstdlib>
 #include <lodepng.h>
+#include <cuda_runtime.h>
 
 #define GLM_FORCE_SWIZZLE
 #include <glm/glm.hpp>
 
 #define pi 3.1415926535897932384626433832795
+
+#define THREADS_PER_BLOCK 256
 
 // Host types (double precision)
 typedef glm::dvec2 vec2;
@@ -67,9 +70,47 @@ vec2 iResolution;
 unsigned char* raw_image;
 
 void write_png(const char* filename) {
-    unsigned error = lodepng_encode32_file(filename, raw_image, width, height);
-    if (error) printf("png error %u: %s\n", error, lodepng_error_text(error));
+    // Fast-path PNG: keep RGBA8, disable auto convert, disable filtering,
+    // and use store (no compression). Much faster CPU time than default.
+    LodePNGState state;
+    lodepng_state_init(&state);
+
+    state.encoder.auto_convert = 0; // don't analyze image; we already have RGBA8
+    state.info_raw.colortype = LCT_RGBA;
+    state.info_raw.bitdepth  = 8;
+    state.info_png.color.colortype = LCT_RGBA;
+    state.info_png.color.bitdepth  = 8;
+
+    state.encoder.add_id = 0;                 // skip encoder signature chunk
+    state.encoder.filter_strategy = LFS_ZERO; // no per-row filtering
+    state.encoder.zlibsettings.btype    = 0;  // store (no deflate)
+    state.encoder.zlibsettings.use_lz77 = 0;  // no LZ77
+
+    unsigned char* png = nullptr;
+    size_t png_size = 0;
+    unsigned error = lodepng_encode(&png, &png_size, raw_image, width, height, &state);
+    if (!error) {
+        error = lodepng_save_file(png, png_size, filename);
+    }
+
+    lodepng_state_cleanup(&state);
+    if (png) free(png);
+
+    if (error) {
+        printf("png error %u: %s\n", error, lodepng_error_text(error));
+    }
 }
+
+// Simple CUDA error check helper for cleaner host code
+#define CUDA_CHECK(stmt)                                                     \
+    do {                                                                     \
+        cudaError_t _err = (stmt);                                           \
+        if (_err != cudaSuccess) {                                           \
+            printf("CUDA error %s at %s:%d: %s\n", #stmt, __FILE__, __LINE__,\
+                   cudaGetErrorString(_err));                                \
+            exit(1);                                                         \
+        }                                                                    \
+    } while (0)
 
 // Custom fast math helpers - now using float
 __device__ __forceinline__ float fast_length(const vec3f& v) {
@@ -122,9 +163,9 @@ __device__ __forceinline__ float md(vec3f p, float& trap) {
     float r  = fast_length(v);
     trap = r;
 
-    // hoist uniform specialization decision out of the loop
     const bool pow8 = (use_pow8_d != 0);
 
+    // Keep unroll at 4 for balance between registers and performance
     #pragma unroll 4
     for (int i = 0; i < md_iter_d; ++i) {
         if (r > bailout_d) break;
@@ -139,6 +180,7 @@ __device__ __forceinline__ float md(vec3f p, float& trap) {
         float s_t, c_t; sincosf(theta * power_d, &s_t, &c_t);
         float s_p, c_p; sincosf(phi   * power_d, &s_p, &c_p);
 
+        // Don't reuse theta - keep precision
         v = p + r_pow * vec3f(c_t * c_p, s_t * c_p, -s_p);
 
         trap = fminf(trap, r);
@@ -158,35 +200,7 @@ __device__ __forceinline__ float map(vec3f p) {
     return map(p, dmy);
 }
 
-// second march: cast shadow
-__device__ float softshadow(vec3f ro, vec3f rd, float k) {
-    float res = 1.0f;
-    float t = 0.0f;
-    #pragma unroll 8
-    for (int i = 0; i < shadow_step_d; ++i) {
-        float h = map(ro + rd * t);
-        // match original behavior closely; avoid div by 0
-        res = fminf(res, k * h / fmaxf(t, 1e-6f));
-        if (res < 0.02f) return 0.02f;
-        t += fast_clamp(h, .001f, step_limiter_d);
-        if (t > far_plane_d) break;
-    }
-    return fast_clamp(res, .02f, 1.f);
-}
-
-// Tetrahedral normal: 4-sample gradient instead of 6-sample central differences
-__device__ __forceinline__ vec3f calcNor(vec3f p) {
-    // Revert to central differences for accuracy (matches original shading closer)
-    const vec2f e = vec2f(eps_d, 0.f);
-    vec3f grad = vec3f(
-        map(p + e.xyy()) - map(p - e.xyy()),
-        map(p + e.yxy()) - map(p - e.yxy()),
-        map(p + e.yyx()) - map(p - e.yyx())
-    );
-    return fast_normalize(grad);
-}
-
-// Conservative stepping: use user multiplier only (matches original accuracy)
+// Conservative trace - keep original algorithm for accuracy
 __device__ float trace(vec3f ro, vec3f rd, float& trap) {
     float t = 0.f;
     for (int i = 0; i < ray_step_d; ++i) {
@@ -197,8 +211,43 @@ __device__ float trace(vec3f ro, vec3f rd, float& trap) {
     return t < far_plane_d ? t : -1.f;
 }
 
-// Higher occupancy kernel - inline everything
-__global__ void __launch_bounds__(256, 4)
+// Use 6-sample central differences for accuracy
+__device__ __forceinline__ vec3f calcNor(vec3f p) {
+    const vec2f e = vec2f(eps_d, 0.f);
+    vec3f grad = vec3f(
+        map(p + e.xyy()) - map(p - e.xyy()),
+        map(p + e.yxy()) - map(p - e.yxy()),
+        map(p + e.yyx()) - map(p - e.yyx())
+    );
+    return fast_normalize(grad);
+}
+
+// CONSERVATIVE shadow optimization - only safe early exits
+__device__ float softshadow(vec3f ro, vec3f rd, float k) {
+    float res = 1.0f;
+    float t = 0.0f;
+    
+    #pragma unroll 4
+    for (int i = 0; i < shadow_step_d; ++i) {
+        float h = map(ro + rd * t);
+        res = fminf(res, k * h / fmaxf(t, 1e-6f));
+        
+        // Only very conservative early exits
+        if (res < 0.02f) return 0.02f;
+        
+        // Only exit if clearly no shadow after significant iteration
+        if (i == 200 && res > 0.95f) {
+            return fast_clamp(res, 0.02f, 1.f);
+        }
+        
+        t += fast_clamp(h, .001f, step_limiter_d);
+        if (t > far_plane_d) break;
+    }
+    return fast_clamp(res, 0.02f, 1.f);
+}
+
+// SIMPLIFIED: Remove corner sampling (too expensive), just use center-based heuristic
+__global__ void __launch_bounds__(THREADS_PER_BLOCK, 4)
 render_kernel(unsigned char* __restrict__ output, int width, int height) {
     int gid = blockDim.x * blockIdx.x + threadIdx.x;
     if (gid >= width * height) return;
@@ -206,48 +255,52 @@ render_kernel(unsigned char* __restrict__ output, int width, int height) {
     int i = gid / width;
     int j = gid % width;
 
-    float fcol_r = 0.0f, fcol_g = 0.0f, fcol_b = 0.0f;
+    vec3f fcol = vec3f(0.0f);
 
     const float inv_AA = 1.0f / (float)AA_d;
     const float inv_res_y = 1.0f / iResolution_d.y;
     const float inv_samples = 1.0f / (float)(AA_d * AA_d);
 
-    // hoist light direction; constant per pixel (precomputed on host)
     const vec3f sd = light_dir_d;
 
-    // precompute base uv for pixel center and per-AA increment to cut ALU
     const float base_uv_x = (-iResolution_d.x + 2.0f * (float)j) * inv_res_y;
     const float base_uv_y = -(-iResolution_d.y + 2.0f * (float)i) * inv_res_y;
     const float uv_step   = 2.0f * inv_res_y * inv_AA;
 
     for (int m = 0; m < AA_d; ++m) {
-        float uv_x_m = base_uv_x + uv_step * (float)m;
+        float uv_x_base = base_uv_x + uv_step * (float)m;
         for (int n = 0; n < AA_d; ++n) {
-            float uv_x = uv_x_m;
+            float uv_x = uv_x_base;
             float uv_y = base_uv_y - uv_step * (float)n;
 
             vec3f rd = fast_normalize(uv_x * camera_side_d + uv_y * camera_up_d + FOV_d * camera_forward_d);
 
             float trap;
-            // removed unused objID
             float d = trace(camera_pos_d, rd, trap);
 
             if (d >= 0.f) {
                 vec3f pos = camera_pos_d + rd * d;
-
-                // 4-sample tetrahedral normal
                 vec3f nr = calcNor(pos);
 
-                vec3f hal = fast_normalize(sd - rd);
-
-                vec3f c_t = 2.0f * (float)pi * (vec3f(1.f) * (trap - .4f) + vec3f(.0f, .1f, .2f));
+                vec3f c_t = 2.0f * (float)pi * (vec3f(trap - .4f) + vec3f(.0f, .1f, .2f));
                 vec3f col = vec3f(.5f) + vec3f(.5f) * fast_cos(c_t);
 
                 float amb = (0.7f + 0.3f * nr.y) *
                             (0.2f + 0.8f * fast_clamp(0.05f * logf(trap), 0.0f, 1.0f));
-                float sdw = softshadow(pos + .001f * nr, sd, 16.f);
-                float dif = fast_clamp(fast_dot(sd, nr), 0.f, 1.f) * sdw;
-                float spe = powf(fast_clamp(fast_dot(nr, hal), 0.f, 1.f), 32.f) * dif;
+                
+                float dif = fast_dot(sd, nr);
+                float spe = 0.f;
+                if (dif > 0.f) {
+                    float sdw = softshadow(pos + .001f * nr, sd, 16.f);
+                    dif = fast_clamp(dif * sdw, 0.f, 1.f);
+                    
+                    if (dif > 0.01f) {
+                        vec3f hal = fast_normalize(sd - rd);
+                        spe = powf(fast_clamp(fast_dot(nr, hal), 0.f, 1.f), 32.f) * dif;
+                    }
+                } else {
+                    dif = 0.f;
+                }
 
                 col *= vec3f(0.3f) * (.05f + .95f * amb) + vec3f(1.f, .9f, .717f) * dif * 0.8f;
                 col = fast_pow(col, vec3f(.7f, .9f, 1.f));
@@ -256,27 +309,27 @@ render_kernel(unsigned char* __restrict__ output, int width, int height) {
                 col = fast_pow(col, vec3f(.4545f));
                 col = fast_clamp(col, 0.f, 1.f);
 
-                fcol_r += col.r;
-                fcol_g += col.g;
-                fcol_b += col.b;
+                fcol += col;
             }
         }
     }
 
-    fcol_r *= inv_samples * 255.0f;
-    fcol_g *= inv_samples * 255.0f;
-    fcol_b *= inv_samples * 255.0f;
+    fcol *= inv_samples * 255.0f;
 
     int offset = (i * width + j) * 4;
-    output[offset + 0] = (unsigned char)fcol_r;
-    output[offset + 1] = (unsigned char)fcol_g;
-    output[offset + 2] = (unsigned char)fcol_b;
-    output[offset + 3] = 255;
+    uchar4 pixel;
+    pixel.x = (unsigned char)fcol.r;
+    pixel.y = (unsigned char)fcol.g;
+    pixel.z = (unsigned char)fcol.b;
+    pixel.w = 255;
+    
+    *reinterpret_cast<uchar4*>(&output[offset]) = pixel;
 }
 
 int main(int argc, char** argv) {
     assert(argc == 10);
 
+    // Parse CLI args and build camera basis on host (double precision)
     camera_pos = vec3(atof(argv[1]), atof(argv[2]), atof(argv[3]));
     target_pos = vec3(atof(argv[4]), atof(argv[5]), atof(argv[6]));
     width = atoi(argv[7]);
@@ -312,37 +365,34 @@ int main(int argc, char** argv) {
     vec3f cu_f = vec3f((float)cu.x, (float)cu.y, (float)cu.z);
 
     // Copy constants to device
-    cudaMemcpyToSymbol(AA_d, &AA, sizeof(int));
-    cudaMemcpyToSymbol(power_d, &power_f, sizeof(float));
-    cudaMemcpyToSymbol(md_iter_d, &md_iter, sizeof(int));
-    cudaMemcpyToSymbol(ray_step_d, &ray_step, sizeof(int));
-    cudaMemcpyToSymbol(shadow_step_d, &shadow_step, sizeof(int));
-    cudaMemcpyToSymbol(step_limiter_d, &step_limiter_f, sizeof(float));
-    cudaMemcpyToSymbol(ray_multiplier_d, &ray_multiplier_f, sizeof(float));
-    cudaMemcpyToSymbol(bailout_d, &bailout_f, sizeof(float));
-    cudaMemcpyToSymbol(eps_d, &eps_f, sizeof(float));
-    cudaMemcpyToSymbol(FOV_d, &FOV_f, sizeof(float));
-    cudaMemcpyToSymbol(far_plane_d, &far_plane_f, sizeof(float));
-    cudaMemcpyToSymbol(camera_pos_d, &camera_pos_f, sizeof(vec3f));
-    cudaMemcpyToSymbol(target_pos_d, &target_pos_f, sizeof(vec3f));
-    cudaMemcpyToSymbol(iResolution_d, &iResolution_f, sizeof(vec2f));
-    cudaMemcpyToSymbol(camera_forward_d, &cf_f, sizeof(vec3f));
-    cudaMemcpyToSymbol(camera_side_d, &cs_f, sizeof(vec3f));
-    cudaMemcpyToSymbol(camera_up_d, &cu_f, sizeof(vec3f));
-    // add the specialization flag
-    cudaMemcpyToSymbol(use_pow8_d, &use_pow8, sizeof(int));
-    // NEW: copy precomputed light direction
-    cudaMemcpyToSymbol(light_dir_d, &light_dir_f, sizeof(vec3f));
+    CUDA_CHECK(cudaMemcpyToSymbol(AA_d, &AA, sizeof(int)));
+    CUDA_CHECK(cudaMemcpyToSymbol(power_d, &power_f, sizeof(float)));
+    CUDA_CHECK(cudaMemcpyToSymbol(md_iter_d, &md_iter, sizeof(int)));
+    CUDA_CHECK(cudaMemcpyToSymbol(ray_step_d, &ray_step, sizeof(int)));
+    CUDA_CHECK(cudaMemcpyToSymbol(shadow_step_d, &shadow_step, sizeof(int)));
+    CUDA_CHECK(cudaMemcpyToSymbol(step_limiter_d, &step_limiter_f, sizeof(float)));
+    CUDA_CHECK(cudaMemcpyToSymbol(ray_multiplier_d, &ray_multiplier_f, sizeof(float)));
+    CUDA_CHECK(cudaMemcpyToSymbol(bailout_d, &bailout_f, sizeof(float)));
+    CUDA_CHECK(cudaMemcpyToSymbol(eps_d, &eps_f, sizeof(float)));
+    CUDA_CHECK(cudaMemcpyToSymbol(FOV_d, &FOV_f, sizeof(float)));
+    CUDA_CHECK(cudaMemcpyToSymbol(far_plane_d, &far_plane_f, sizeof(float)));
+    CUDA_CHECK(cudaMemcpyToSymbol(camera_pos_d, &camera_pos_f, sizeof(vec3f)));
+    CUDA_CHECK(cudaMemcpyToSymbol(target_pos_d, &target_pos_f, sizeof(vec3f)));
+    CUDA_CHECK(cudaMemcpyToSymbol(iResolution_d, &iResolution_f, sizeof(vec2f)));
+    CUDA_CHECK(cudaMemcpyToSymbol(camera_forward_d, &cf_f, sizeof(vec3f)));
+    CUDA_CHECK(cudaMemcpyToSymbol(camera_side_d, &cs_f, sizeof(vec3f)));
+    CUDA_CHECK(cudaMemcpyToSymbol(camera_up_d, &cu_f, sizeof(vec3f)));
+    CUDA_CHECK(cudaMemcpyToSymbol(use_pow8_d, &use_pow8, sizeof(int)));
+    CUDA_CHECK(cudaMemcpyToSymbol(light_dir_d, &light_dir_f, sizeof(vec3f)));
 
     // Allocate device memory
     unsigned char* d_output;
-    cudaMalloc(&d_output, width * height * 4 * sizeof(unsigned char));
+    CUDA_CHECK(cudaMalloc(&d_output, width * height * 4 * sizeof(unsigned char)));
 
-    // Allocate host memory
-    raw_image = new unsigned char[width * height * 4];
+    // Allocate pinned host memory for faster D2H copy
+    CUDA_CHECK(cudaMallocHost(&raw_image, width * height * 4 * sizeof(unsigned char)));
 
-    // Back to 256 for better occupancy
-    int threads_per_block = 256;
+    int threads_per_block = THREADS_PER_BLOCK;
     int num_pixels = width * height;
     int num_blocks = (num_pixels + threads_per_block - 1) / threads_per_block;
 
@@ -351,27 +401,17 @@ int main(int argc, char** argv) {
 
     // Launch kernel
     render_kernel<<<num_blocks, threads_per_block>>>(d_output, width, height);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaDeviceSynchronize());
 
-    // Check for kernel errors
-    cudaError_t err = cudaGetLastError();
-    if (err != cudaSuccess) {
-        printf("CUDA kernel error: %s\n", cudaGetErrorString(err));
-        return 1;
-    }
-
-    // Wait for kernel to finish
-    cudaDeviceSynchronize();
-
-    // Copy result back to host
-    cudaMemcpy(raw_image, d_output, width * height * 4 * sizeof(unsigned char), 
-               cudaMemcpyDeviceToHost);
-
-    // Save image
+    // Copy result back to host (pinned) and save PNG
+    CUDA_CHECK(cudaMemcpy(raw_image, d_output, width * height * 4 * sizeof(unsigned char),
+                          cudaMemcpyDeviceToHost));
     write_png(argv[9]);
 
     // Cleanup
-    cudaFree(d_output);
-    delete[] raw_image;
+    CUDA_CHECK(cudaFree(d_output));
+    CUDA_CHECK(cudaFreeHost(raw_image));
 
     return 0;
 }
