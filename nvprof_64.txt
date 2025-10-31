@@ -1,0 +1,32 @@
+[b12901069@un-ln01 hw3]$ srun -N 1 -n 1 --gpus-per-node 1 -A ACD114118 -t 15 nvprof ./hw3 -1.2 -0.51 -0.8 -0.271 -0.299 -0.379 4096 4096 nvprof.png
+WARNING: When login node is DOWN, Your Job will FAIL!
+WARNING: Please use `sbatch` instead :)
+srun: INFO: Try to avoid using --ntasks
+srun: INFO: It is recommended to specify `--nodes` and `--ntasks-per-node` together
+==1286827== NVPROF is profiling process 1286827, command: ./hw3 -1.2 -0.51 -0.8 -0.271 -0.299 -0.379 4096 4096 nvprof.png
+==1286827== Profiling application: ./hw3 -1.2 -0.51 -0.8 -0.271 -0.299 -0.379 4096 4096 nvprof.png
+==1286827== Profiling result:
+            Type  Time(%)      Time     Calls       Avg       Min       Max  Name
+ GPU activities:   99.79%  2.55285s         1  2.55285s  2.55285s  2.55285s  render_kernel(unsigned char*, int, int)
+                    0.21%  5.3480ms         1  5.3480ms  5.3480ms  5.3480ms  [CUDA memcpy DtoH]
+                    0.00%  24.864us        19  1.3080us  1.2800us  1.3120us  [CUDA memcpy HtoD]
+      API calls:   94.84%  2.55285s         1  2.55285s  2.55285s  2.55285s  cudaDeviceSynchronize
+                    3.55%  95.489ms        19  5.0257ms  6.7260us  95.343ms  cudaMemcpyToSymbol
+                    0.97%  26.071ms         1  26.071ms  26.071ms  26.071ms  cudaHostAlloc
+                    0.40%  10.878ms         1  10.878ms  10.878ms  10.878ms  cudaFreeHost
+                    0.20%  5.4243ms         1  5.4243ms  5.4243ms  5.4243ms  cudaMemcpy
+                    0.01%  388.01us       114  3.4030us      68ns  186.16us  cuDeviceGetAttribute
+                    0.01%  368.84us         1  368.84us  368.84us  368.84us  cudaFree
+                    0.01%  209.54us         1  209.54us  209.54us  209.54us  cudaMalloc
+                    0.00%  106.59us         1  106.59us  106.59us  106.59us  cudaLaunchKernel
+                    0.00%  9.6570us         1  9.6570us  9.6570us  9.6570us  cuDeviceGetName
+                    0.00%  8.2280us         1  8.2280us  8.2280us  8.2280us  cuDeviceGetPCIBusId
+                    0.00%  4.7350us         1  4.7350us  4.7350us  4.7350us  cudaGetLastError
+                    0.00%     949ns         3     316ns      96ns     752ns  cuDeviceGetCount
+                    0.00%     641ns         2     320ns     102ns     539ns  cuDeviceGet
+                    0.00%     322ns         1     322ns     322ns     322ns  cuDeviceTotalMem
+                    0.00%     304ns         1     304ns     304ns     304ns  cuDeviceGetUuid
+                    0.00%     214ns         1     214ns     214ns     214ns  cuModuleGetLoadingMode
+Rendering with 262144 blocks and 64 threads per block
+Total pixels: 16777216
+
