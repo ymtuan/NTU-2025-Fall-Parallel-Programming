@@ -7,6 +7,8 @@ OUT_DIR=outputs
 LOG_DIR=logs
 LOG_FILE=$LOG_DIR/test_results.log
 
+SRUN_CMD="srun -N 1 -n 1 --gpus-per-node 1 -A ACD114118 -t 4"
+
 mkdir -p "$OUT_DIR" "$LOG_DIR"
 
 # Temporary log for current run
@@ -33,12 +35,15 @@ for i in 0 1 2 3; do
         exit 1
     fi
 
-    start_time=$(date +%s.%N)
-    "$BIN" "$in_file" "$out_file" >/dev/null 2>&1 || echo "Execution error case0$i"
-    end_time=$(date +%s.%N)
+    echo "Running case0$i under srun..."
 
-    # Compute elapsed time to 2 decimal places
-    elapsed=$(echo "$end_time - $start_time" | bc)
+    # Run inside srun and capture only the internal runtime (not queue time)
+    time_output=$(mktemp)
+    $SRUN_CMD bash -c "TIMEFORMAT='%3R'; time $BIN '$in_file' '$out_file' >/dev/null 2>&1" 2> "$time_output" || echo "Execution error case0$i"
+    elapsed=$(cat "$time_output" | tail -n 1 | tr -d '\r\n')
+    rm -f "$time_output"
+
+    # Format elapsed to 2 decimal places
     elapsed=$(printf "%.2f" "$elapsed")
 
     # Accumulate total runtime
@@ -64,9 +69,7 @@ done
 # Determine if this run is the best (minimum total runtime among all logs)
 is_best="NO"
 if [[ -f "$LOG_FILE" ]]; then
-    # Extract previous total runtimes (from lines starting with "Total,")
     prev_best=$(grep "^Total," "$LOG_FILE" | awk -F',' '{print $2}' | sort -n | head -n 1)
-    # Compare with current total_time
     if [[ -z "$prev_best" || $(echo "$total_time < $prev_best" | bc) -eq 1 ]]; then
         is_best="YES"
     fi

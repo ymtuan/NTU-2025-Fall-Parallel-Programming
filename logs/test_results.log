@@ -1,7 +1,7 @@
-==== Test Run Wed Nov 12 14:38:47 CST 2025 ====
+==== Test Run Wed Nov 12 15:47:05 CST 2025 ====
 Case,Elapsed(s),NonceProduced,NonceExpected,Match
-case00,4.30,edb21fb0,edb21fb0,YES
-case01,9.52,5ea01346,5ea01346,YES
-case02,1.97,bac0ac2e,bac0ac2e,YES
-case03,0.59,2008e816,2008e816,YES
-Total,16.38,YES
+case00,4.00,edb21fb0,edb21fb0,YES
+case01,9.22,5ea01346,5ea01346,YES
+case02,1.63,bac0ac2e,bac0ac2e,YES
+case03,0.27,2008e816,2008e816,YES
+Total,15.12,YES
