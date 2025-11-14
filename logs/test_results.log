@@ -1,3 +1,17 @@
+==== Test Run Fri Nov 14 17:11:17 CST 2025 ====
+Case,Elapsed(s),NonceProduced,NonceExpected,Match
+case00,1.11,edb21fb0,edb21fb0,YES
+case01,11.60,5ea01346,5ea01346,YES
+case02,3.38,bac0ac2e,bac0ac2e,YES
+case03,2.78,2008e816,2008e816,YES
+Total,18.87,NO
+==== Test Run Fri Nov 14 17:06:18 CST 2025 ====
+Case,Elapsed(s),NonceProduced,NonceExpected,Match
+case00,4.49,edb21fb0,edb21fb0,YES
+case01,8.28,5ea01346,5ea01346,YES
+case02,1.95,bac0ac2e,bac0ac2e,YES
+case03,1.33,2008e816,2008e816,YES
+Total,16.05,NO
 ==== Test Run Wed Nov 12 15:47:05 CST 2025 ====
 Case,Elapsed(s),NonceProduced,NonceExpected,Match
 case00,4.00,edb21fb0,edb21fb0,YES

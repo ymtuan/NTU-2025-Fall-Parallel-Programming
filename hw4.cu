@@ -121,83 +121,40 @@ void calc_merkle_root(unsigned char *root, int count, char **branch) {
 
 // ------------------ Device Globals ------------------
 __constant__ unsigned char d_target[32];
+__constant__ WORD d_midstate[8];  // Pre-computed midstate for first 64 bytes
 __device__ unsigned int d_solution_nonce;
 __device__ int d_found;
 __device__ unsigned char d_solution_hash[32];
 
-// New constants for optimized mining
-__constant__ WORD d_midstate[8];          // midstate after first 64 bytes
-__constant__ unsigned char d_tail_fixed[12]; // bytes 64..75 (last 16 bytes = 12 fixed + 4 nonce)
-
-// ------------------ Kernel ------------------
-__global__ void mine_kernel(HashBlock base, unsigned long long max_nonce_space) {
+// ------------------ Optimized Mining Kernel with Midstate ------------------
+__global__ void mine_kernel_midstate(const unsigned char *last12bytes, unsigned long long max_nonce_space) {
     unsigned long long tid = blockIdx.x * (unsigned long long)blockDim.x + threadIdx.x;
     unsigned long long total_threads = (unsigned long long)gridDim.x * blockDim.x;
+    
     for(unsigned long long nonce = tid; nonce < max_nonce_space; nonce += total_threads) {
-        if(atomicAdd(&d_found, 0) != 0) return;
-        HashBlock local = base;
-        local.nonce = (unsigned int)nonce;
-        SHA256 ctx;
-        double_sha256(&ctx, (unsigned char*)&local, sizeof(HashBlock));
-        if(little_endian_bit_comparison(ctx.b, d_target, 32) < 0) {
-            if(atomicCAS(&d_found, 0, 1) == 0) {
-                d_solution_nonce = (unsigned int)nonce;
-                for(int i=0;i<32;++i) d_solution_hash[i] = ctx.b[i];
-            }
-            return;
-        }
-    }
-}
-
-// Optimized kernel: use midstate and only process second chunk
-__global__ void mine_kernel_opt(unsigned long long max_nonce_space,
-                                unsigned long long total_threads,
-                                unsigned char *out_hash) {
-    unsigned long long tid = blockIdx.x * (unsigned long long)blockDim.x + threadIdx.x;
-    for(unsigned long long nonce = tid; nonce < max_nonce_space; nonce += total_threads) {
-        if(atomicAdd(&d_found, 0) != 0) return;
-
-        // Build second 512-bit chunk (64 bytes)
-        unsigned char chunk[64];
-        // bytes 0..11 fixed tail
-        #pragma unroll
-        for(int i=0;i<12;++i) chunk[i] = d_tail_fixed[i];
-        // bytes 12..15 = nonce (little-endian as in header)
-        unsigned int n = (unsigned int)nonce;
-        chunk[12] = (unsigned char)(n & 0xff);
-        chunk[13] = (unsigned char)((n >> 8) & 0xff);
-        chunk[14] = (unsigned char)((n >> 16) & 0xff);
-        chunk[15] = (unsigned char)((n >> 24) & 0xff);
-        // padding
-        chunk[16] = 0x80;
-        for(int i=17;i<56;++i) chunk[i] = 0x00;
-        // message length (80 bytes = 640 bits) big-endian per existing implementation pattern
-        unsigned long long L = 640ULL;
-        chunk[63] = (unsigned char)(L);
-        chunk[62] = (unsigned char)(L >> 8);
-        chunk[61] = (unsigned char)(L >> 16);
-        chunk[60] = (unsigned char)(L >> 24);
-        chunk[59] = (unsigned char)(L >> 32);
-        chunk[58] = (unsigned char)(L >> 40);
-        chunk[57] = (unsigned char)(L >> 48);
-        chunk[56] = (unsigned char)(L >> 56);
-
-        // First hash (complete) from midstate + this chunk
+        // Early exit if solution found
+        if(d_found) return;
+        
+        // Build last 16 bytes: last12bytes + nonce (little-endian)
+        unsigned char last16[16];
+        for(int i=0;i<12;++i) last16[i] = last12bytes[i];
+        last16[12] = (unsigned char)(nonce);
+        last16[13] = (unsigned char)(nonce >> 8);
+        last16[14] = (unsigned char)(nonce >> 16);
+        last16[15] = (unsigned char)(nonce >> 24);
+        
+        // First SHA256: finalize from midstate
         SHA256 ctx1;
-        sha256_transform_from_state(d_midstate, chunk, &ctx1);
-
-        // Second hash (standard)
+        sha256_finalize_from_midstate(&ctx1, d_midstate, last16);
+        
+        // Second SHA256: full hash of the 32-byte result
         SHA256 ctx2;
         sha256(&ctx2, ctx1.b, 32);
-
+        
         if(little_endian_bit_comparison(ctx2.b, d_target, 32) < 0) {
             if(atomicCAS(&d_found, 0, 1) == 0) {
                 d_solution_nonce = (unsigned int)nonce;
                 for(int i=0;i<32;++i) d_solution_hash[i] = ctx2.b[i];
-                // Optionally copy out hash for debug
-                if(out_hash){
-                    for(int i=0;i<32;++i) out_hash[i] = ctx2.b[i];
-                }
             }
             return;
         }
@@ -226,37 +183,40 @@ bool gpu_mine(HashBlock &block, const unsigned char target_hex[32],
               unsigned int &out_nonce, unsigned char out_hash[32],
               unsigned long long max_nonce_space) {
 
-    // Prepare 80-byte header (Bitcoin-like)
-    unsigned char header[80];
-    // layout: version(4) + prevhash(32) + merkle(32) + ntime(4) + nbits(4) + nonce(4)
-    memcpy(header, &block.version, 4);
-    memcpy(header+4,  block.prevhash, 32);
-    memcpy(header+36, block.merkle_root, 32);
-    memcpy(header+68, &block.ntime, 4);
-    memcpy(header+72, &block.nbits, 4);
-    // nonce left zero for midstate (inserted in kernel)
-    memset(header+76, 0, 4);
-
-    // Compute midstate of first 64 bytes
-    WORD midstate_host[8];
-    sha256_compute_midstate(header, midstate_host);
-
-    // Upload target, midstate, tail (bytes 64..75)
+    // Compute midstate for first 64 bytes
+    unsigned char first64[64];
+    memcpy(first64, &block, 64);
+    WORD midstate[8];
+    sha256_compute_midstate(first64, midstate);
+    
+    // Upload midstate and target to device
+    CUDA_CALL_OR_FALSE(cudaMemcpyToSymbol(d_midstate, midstate, sizeof(midstate)));
     CUDA_CALL_OR_FALSE(cudaMemcpyToSymbol(d_target, target_hex, 32));
+    
+    // Extract last 12 bytes (before nonce) - bytes 64-75
+    unsigned char last12[12];
+    memcpy(last12, ((unsigned char*)&block) + 64, 12);
+    
+    // Upload last12 bytes to device
+    unsigned char *d_last12;
+    CUDA_CALL_OR_FALSE(cudaMalloc(&d_last12, 12));
+    CUDA_CALL_OR_FALSE(cudaMemcpy(d_last12, last12, 12, cudaMemcpyHostToDevice));
+    
     int zero = 0;
     CUDA_CALL_OR_FALSE(cudaMemcpyToSymbol(d_found, &zero, sizeof(int)));
     unsigned int init_nonce = 0;
     CUDA_CALL_OR_FALSE(cudaMemcpyToSymbol(d_solution_nonce, &init_nonce, sizeof(unsigned int)));
-    CUDA_CALL_OR_FALSE(cudaMemcpyToSymbol(d_midstate, midstate_host, sizeof(midstate_host)));
-    CUDA_CALL_OR_FALSE(cudaMemcpyToSymbol(d_tail_fixed, header+64, 12));
 
-    // Launch optimized kernel
-    dim3 threads(256);
-    dim3 blocks(512);
-    unsigned long long total_threads = (unsigned long long)threads.x * blocks.x;
-    mine_kernel_opt<<<blocks, threads>>>(max_nonce_space, total_threads, nullptr);
-    if(cudaDeviceSynchronize() != cudaSuccess) {
-        fprintf(stderr,"Kernel failure\n");
+    // Launch with massive parallelism
+    int threads = 256;
+    int blocks = 65535;
+    
+    mine_kernel_midstate<<<blocks, threads>>>(d_last12, max_nonce_space);
+    cudaError_t err = cudaDeviceSynchronize();
+    cudaFree(d_last12);
+    
+    if(err != cudaSuccess) {
+        fprintf(stderr,"Kernel failure: %s\n", cudaGetErrorString(err));
         return false;
     }
 

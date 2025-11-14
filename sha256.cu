@@ -52,22 +52,14 @@ __host__ __device__ void sha256_transform(SHA256 *ctx, const BYTE *msg)
 	WORD a, b, c, d, e, f, g, h;
 	WORD i, j;
 	
-	// Create a 64-entry message schedule array w[0..63] of 32-bit words
-	WORD w[64];
+	// Use 16-entry circular buffer instead of 64
+	WORD w[16];
+	
 	// Copy chunk into first 16 words w[0..15] of the message schedule array
 	for(i=0, j=0;i<16;++i, j+=4)
 	{
 		w[i] = (msg[j]<<24) | (msg[j+1]<<16) | (msg[j+2]<<8) | (msg[j+3]);
 	}
-	
-	// Extend the first 16 words into the remaining 48 words w[16..63] of the message schedule array:
-	for(i=16;i<64;++i)
-	{
-		WORD s0 = (_rotr(w[i-15], 7)) ^ (_rotr(w[i-15], 18)) ^ (w[i-15]>>3);
-		WORD s1 = (_rotr(w[i-2], 17)) ^ (_rotr(w[i-2], 19))  ^ (w[i-2]>>10);
-		w[i] = w[i-16] + s0 + w[i-7] + s1;
-	}
-	
 	
 	// Initialize working variables to current hash value
 	a = ctx->h[0];
@@ -79,14 +71,30 @@ __host__ __device__ void sha256_transform(SHA256 *ctx, const BYTE *msg)
 	g = ctx->h[6];
 	h = ctx->h[7];
 	
-	// Compress function main loop:
+	// Compress function main loop with circular indexing
 	for(i=0;i<64;++i)
 	{
+		WORD s0, s1, wval;
+		
+		// Compute current w value (circular buffer, index i%16)
+		if(i >= 16) {
+			// w[i] = w[i-16] + s0(w[i-15]) + w[i-7] + s1(w[i-2])
+			WORD w_i_15 = w[(i+1) & 15];   // i-15 mod 16
+			WORD w_i_2  = w[(i+14) & 15];  // i-2 mod 16
+			WORD w_i_7  = w[(i+9) & 15];   // i-7 mod 16
+			WORD w_i_16 = w[i & 15];       // i-16 mod 16
+			
+			s0 = (_rotr(w_i_15, 7)) ^ (_rotr(w_i_15, 18)) ^ (w_i_15 >> 3);
+			s1 = (_rotr(w_i_2, 17)) ^ (_rotr(w_i_2, 19)) ^ (w_i_2 >> 10);
+			w[i & 15] = w_i_16 + s0 + w_i_7 + s1;
+		}
+		wval = w[i & 15];
+		
 		WORD S0 = (_rotr(a, 2)) ^ (_rotr(a, 13)) ^ (_rotr(a, 22));
 		WORD S1 = (_rotr(e, 6)) ^ (_rotr(e, 11)) ^ (_rotr(e, 25));
 		WORD ch = (e & f) ^ ((~e) & g);
 		WORD maj = (a & b) ^ (a & c) ^ (b & c);
-		WORD temp1 = h + S1 + ch + K(i) + w[i];
+		WORD temp1 = h + S1 + ch + K(i) + wval;
 		WORD temp2 = S0 + maj;
 		
 		h = g;
@@ -212,6 +220,37 @@ __host__ __device__ void sha256_transform_from_state(const WORD *state, const BY
         _swap(out_ctx->b[i],   out_ctx->b[i+3]);
         _swap(out_ctx->b[i+1], out_ctx->b[i+2]);
     }
+}
+
+// Finalize hash from midstate (process second 64-byte chunk with padding)
+__host__ __device__ void sha256_finalize_from_midstate(SHA256 *ctx, const WORD midstate[8], const BYTE *last16bytes) {
+	// Set state to midstate
+	for(int i=0;i<8;++i) ctx->h[i] = midstate[i];
+	
+	// Build final 64-byte block: last16bytes + padding + length
+	BYTE final_block[64];
+	memcpy(final_block, last16bytes, 16);
+	final_block[16] = 0x80;  // append '1' bit
+	memset(final_block + 17, 0, 64 - 17 - 8);
+	
+	// Length = 80 bytes * 8 = 640 bits (big-endian)
+	unsigned long long bitlen = 640;
+	final_block[63] = bitlen;
+	final_block[62] = bitlen >> 8;
+	final_block[61] = bitlen >> 16;
+	final_block[60] = bitlen >> 24;
+	final_block[59] = bitlen >> 32;
+	final_block[58] = bitlen >> 40;
+	final_block[57] = bitlen >> 48;
+	final_block[56] = bitlen >> 56;
+	
+	sha256_transform(ctx, final_block);
+	
+	// Byte swap for final output
+	for(int i=0;i<32;i+=4){
+		_swap(ctx->b[i],   ctx->b[i+3]);
+		_swap(ctx->b[i+1], ctx->b[i+2]);
+	}
 }
 
 // Unit test
