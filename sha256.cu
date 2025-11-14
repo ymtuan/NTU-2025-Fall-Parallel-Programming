@@ -253,6 +253,37 @@ __host__ __device__ void sha256_finalize_from_midstate(SHA256 *ctx, const WORD m
 	}
 }
 
+// Optimized: hash 32-byte input (common in double-SHA256)
+__host__ __device__ void sha256_32bytes(SHA256 *ctx, const BYTE *msg32) {
+	// Initialize hash values
+	ctx->h[0] = 0x6a09e667;
+	ctx->h[1] = 0xbb67ae85;
+	ctx->h[2] = 0x3c6ef372;
+	ctx->h[3] = 0xa54ff53a;
+	ctx->h[4] = 0x510e527f;
+	ctx->h[5] = 0x9b05688c;
+	ctx->h[6] = 0x1f83d9ab;
+	ctx->h[7] = 0x5be0cd19;
+	
+	// Build single 64-byte block: 32 bytes + padding + length
+	BYTE block[64];
+	for(int i=0; i<32; ++i) block[i] = msg32[i];
+	block[32] = 0x80;
+	for(int i=33; i<56; ++i) block[i] = 0;
+	
+	// Length = 32 * 8 = 256 bits (big-endian)
+	block[56] = 0; block[57] = 0; block[58] = 0; block[59] = 0;
+	block[60] = 0; block[61] = 0; block[62] = 1; block[63] = 0;
+	
+	sha256_transform(ctx, block);
+	
+	// Byte swap for final output
+	for(int i=0;i<32;i+=4){
+		_swap(ctx->b[i],   ctx->b[i+3]);
+		_swap(ctx->b[i+1], ctx->b[i+2]);
+	}
+}
+
 // Unit test
 #ifdef __SHA256_UNITTEST__
 	#define print_hash(x) printf("sha256 hash: "); for(int i=0;i<32;++i)printf("%02X", (x).b[i]);

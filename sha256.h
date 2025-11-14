@@ -26,6 +26,7 @@ void sha256_init_constants(void);
 void sha256_compute_midstate(const unsigned char *chunk64, WORD midstate[8]);
 __host__ __device__ void sha256_transform_from_state(const WORD *state, const BYTE *chunk, SHA256 *out_ctx);
 __host__ __device__ void sha256_finalize_from_midstate(SHA256 *ctx, const WORD midstate[8], const BYTE *last16bytes);
+__host__ __device__ void sha256_32bytes(SHA256 *ctx, const BYTE *msg32);
 
 #ifdef __cplusplus
 }

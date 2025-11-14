@@ -1,3 +1,10 @@
+==== Test Run Fri Nov 14 21:29:34 CST 2025 ====
+Case,Elapsed(s),NonceProduced,NonceExpected,Match
+case00,0.41,edb21fb0,edb21fb0,YES
+case01,3.26,5ea01346,5ea01346,YES
+case02,1.23,bac0ac2e,bac0ac2e,YES
+case03,1.58,2008e816,2008e816,YES
+Total,6.48,YES
 ==== Test Run Fri Nov 14 17:11:17 CST 2025 ====
 Case,Elapsed(s),NonceProduced,NonceExpected,Match
 case00,1.11,edb21fb0,edb21fb0,YES

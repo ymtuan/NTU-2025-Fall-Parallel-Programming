@@ -131,13 +131,26 @@ __global__ void mine_kernel_midstate(const unsigned char *last12bytes, unsigned 
     unsigned long long tid = blockIdx.x * (unsigned long long)blockDim.x + threadIdx.x;
     unsigned long long total_threads = (unsigned long long)gridDim.x * blockDim.x;
     
+    // Load last12bytes into registers once (avoid repeated global memory access)
+    unsigned char l0=last12bytes[0], l1=last12bytes[1], l2=last12bytes[2], l3=last12bytes[3];
+    unsigned char l4=last12bytes[4], l5=last12bytes[5], l6=last12bytes[6], l7=last12bytes[7];
+    unsigned char l8=last12bytes[8], l9=last12bytes[9], l10=last12bytes[10], l11=last12bytes[11];
+    
+    // Batch atomic checks - only check every 256 iterations to reduce contention
+    int local_batch = 0;
+    
     for(unsigned long long nonce = tid; nonce < max_nonce_space; nonce += total_threads) {
-        // Early exit if solution found
-        if(d_found) return;
+        // Batched early exit check (every 256 iterations)
+        if((local_batch & 0xFF) == 0 && d_found) return;
+        local_batch++;
         
-        // Build last 16 bytes: last12bytes + nonce (little-endian)
+        // Build last 16 bytes directly using register values
         unsigned char last16[16];
-        for(int i=0;i<12;++i) last16[i] = last12bytes[i];
+        last16[0]=l0; last16[1]=l1; last16[2]=l2; last16[3]=l3;
+        last16[4]=l4; last16[5]=l5; last16[6]=l6; last16[7]=l7;
+        last16[8]=l8; last16[9]=l9; last16[10]=l10; last16[11]=l11;
+        
+        // Nonce (little-endian, 4 bytes)
         last16[12] = (unsigned char)(nonce);
         last16[13] = (unsigned char)(nonce >> 8);
         last16[14] = (unsigned char)(nonce >> 16);
@@ -147,11 +160,12 @@ __global__ void mine_kernel_midstate(const unsigned char *last12bytes, unsigned 
         SHA256 ctx1;
         sha256_finalize_from_midstate(&ctx1, d_midstate, last16);
         
-        // Second SHA256: full hash of the 32-byte result
+        // Second SHA256: optimized for 32-byte input
         SHA256 ctx2;
-        sha256(&ctx2, ctx1.b, 32);
+        sha256_32bytes(&ctx2, ctx1.b);
         
         if(little_endian_bit_comparison(ctx2.b, d_target, 32) < 0) {
+            // Only update if we're first
             if(atomicCAS(&d_found, 0, 1) == 0) {
                 d_solution_nonce = (unsigned int)nonce;
                 for(int i=0;i<32;++i) d_solution_hash[i] = ctx2.b[i];
@@ -207,8 +221,8 @@ bool gpu_mine(HashBlock &block, const unsigned char target_hex[32],
     unsigned int init_nonce = 0;
     CUDA_CALL_OR_FALSE(cudaMemcpyToSymbol(d_solution_nonce, &init_nonce, sizeof(unsigned int)));
 
-    // Launch with massive parallelism
-    int threads = 256;
+    // Increased parallelism - more threads = better GPU utilization
+    int threads = 512;  // Increased from 256
     int blocks = 65535;
     
     mine_kernel_midstate<<<blocks, threads>>>(d_last12, max_nonce_space);
