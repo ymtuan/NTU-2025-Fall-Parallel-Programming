@@ -7,7 +7,7 @@ OUT_DIR=outputs
 LOG_DIR=logs
 LOG_FILE=$LOG_DIR/test_results.log
 
-SRUN_CMD="srun -N 1 -n 1 --gpus-per-node 1 -A ACD114118 -t 4"
+SRUN_CMD="srun -N 1 -n 1 --gpus-per-node 1 -A ACD114118 -t 1"
 
 mkdir -p "$OUT_DIR" "$LOG_DIR"
 
