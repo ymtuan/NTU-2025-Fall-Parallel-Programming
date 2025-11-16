@@ -280,6 +280,159 @@ __host__ __device__ void sha256_32bytes(SHA256 *ctx, const BYTE *msg32) {
 	}
 }
 
+
+__device__ void sha256_finalize_from_midstate_opt(SHA256 *ctx, const WORD midstate[8], 
+                                                    const BYTE *last16bytes) {
+    // Set starting state
+    ctx->h[0] = midstate[0];
+    ctx->h[1] = midstate[1];
+    ctx->h[2] = midstate[2];
+    ctx->h[3] = midstate[3];
+    ctx->h[4] = midstate[4];
+    ctx->h[5] = midstate[5];
+    ctx->h[6] = midstate[6];
+    ctx->h[7] = midstate[7];
+    
+    // Build w[0..15] directly from last16 + padding
+    WORD w[16];
+    
+    // First 4 words from last16bytes
+    w[0] = (last16bytes[0]<<24) | (last16bytes[1]<<16) | (last16bytes[2]<<8) | last16bytes[3];
+    w[1] = (last16bytes[4]<<24) | (last16bytes[5]<<16) | (last16bytes[6]<<8) | last16bytes[7];
+    w[2] = (last16bytes[8]<<24) | (last16bytes[9]<<16) | (last16bytes[10]<<8) | last16bytes[11];
+    w[3] = (last16bytes[12]<<24) | (last16bytes[13]<<16) | (last16bytes[14]<<8) | last16bytes[15];
+    
+    // Padding: 0x80 followed by zeros
+    w[4] = 0x80000000;
+    w[5] = 0; w[6] = 0; w[7] = 0;
+    w[8] = 0; w[9] = 0; w[10] = 0; w[11] = 0;
+    w[12] = 0; w[13] = 0;
+    
+    // Length = 640 bits (big-endian)
+    w[14] = 0;
+    w[15] = 640;
+    
+    // Now do the compression rounds inline
+    WORD a = ctx->h[0], b = ctx->h[1], c = ctx->h[2], d = ctx->h[3];
+    WORD e = ctx->h[4], f = ctx->h[5], g = ctx->h[6], h = ctx->h[7];
+    
+    // Manually unrolled for better performance
+    #define SHA2_ROUND(i, wval) { \
+        WORD S1 = (_rotr(e,6)) ^ (_rotr(e,11)) ^ (_rotr(e,25)); \
+        WORD ch = (e & f) ^ ((~e) & g); \
+        WORD temp1 = h + S1 + ch + k[i] + wval; \
+        WORD S0 = (_rotr(a,2)) ^ (_rotr(a,13)) ^ (_rotr(a,22)); \
+        WORD maj = (a & b) ^ (a & c) ^ (b & c); \
+        WORD temp2 = S0 + maj; \
+        h = g; g = f; f = e; e = d + temp1; \
+        d = c; c = b; b = a; a = temp1 + temp2; \
+    }
+    
+    // First 16 rounds use w[0..15] directly
+    for(int i=0; i<16; ++i) {
+        SHA2_ROUND(i, w[i]);
+    }
+    
+    // Remaining rounds compute w on the fly
+    for(int i=16; i<64; ++i) {
+        WORD w_i_15 = w[(i+1) & 15];
+        WORD w_i_2  = w[(i+14) & 15];
+        WORD w_i_7  = w[(i+9) & 15];
+        WORD w_i_16 = w[i & 15];
+        
+        WORD s0 = (_rotr(w_i_15,7)) ^ (_rotr(w_i_15,18)) ^ (w_i_15 >> 3);
+        WORD s1 = (_rotr(w_i_2,17)) ^ (_rotr(w_i_2,19)) ^ (w_i_2 >> 10);
+        w[i & 15] = w_i_16 + s0 + w_i_7 + s1;
+        
+        SHA2_ROUND(i, w[i & 15]);
+    }
+    
+    #undef SHA2_ROUND
+    
+    // Add to state
+    ctx->h[0] += a; ctx->h[1] += b; ctx->h[2] += c; ctx->h[3] += d;
+    ctx->h[4] += e; ctx->h[5] += f; ctx->h[6] += g; ctx->h[7] += h;
+    
+    // Byte swap
+    for(int i=0; i<32; i+=4) {
+        _swap(ctx->b[i], ctx->b[i+3]);
+        _swap(ctx->b[i+1], ctx->b[i+2]);
+    }
+}
+
+__device__ void sha256_32bytes_opt(SHA256 *ctx, const BYTE *msg32) {
+    // Build w[0..15] directly
+    WORD w[16];
+    
+    // First 8 words from message
+    w[0] = (msg32[0]<<24) | (msg32[1]<<16) | (msg32[2]<<8) | msg32[3];
+    w[1] = (msg32[4]<<24) | (msg32[5]<<16) | (msg32[6]<<8) | msg32[7];
+    w[2] = (msg32[8]<<24) | (msg32[9]<<16) | (msg32[10]<<8) | msg32[11];
+    w[3] = (msg32[12]<<24) | (msg32[13]<<16) | (msg32[14]<<8) | msg32[15];
+    w[4] = (msg32[16]<<24) | (msg32[17]<<16) | (msg32[18]<<8) | msg32[19];
+    w[5] = (msg32[20]<<24) | (msg32[21]<<16) | (msg32[22]<<8) | msg32[23];
+    w[6] = (msg32[24]<<24) | (msg32[25]<<16) | (msg32[26]<<8) | msg32[27];
+    w[7] = (msg32[28]<<24) | (msg32[29]<<16) | (msg32[30]<<8) | msg32[31];
+    
+    // Padding
+    w[8] = 0x80000000;
+    w[9] = 0; w[10] = 0; w[11] = 0; w[12] = 0; w[13] = 0;
+    w[14] = 0; w[15] = 256;  // Length = 256 bits
+    
+    // Initialize with constants
+    WORD a = 0x6a09e667, b = 0xbb67ae85, c = 0x3c6ef372, d = 0xa54ff53a;
+    WORD e = 0x510e527f, f = 0x9b05688c, g = 0x1f83d9ab, h = 0x5be0cd19;
+    
+    #define SHA2_ROUND(i, wval) { \
+        WORD S1 = (_rotr(e,6)) ^ (_rotr(e,11)) ^ (_rotr(e,25)); \
+        WORD ch = (e & f) ^ ((~e) & g); \
+        WORD temp1 = h + S1 + ch + k[i] + wval; \
+        WORD S0 = (_rotr(a,2)) ^ (_rotr(a,13)) ^ (_rotr(a,22)); \
+        WORD maj = (a & b) ^ (a & c) ^ (b & c); \
+        WORD temp2 = S0 + maj; \
+        h = g; g = f; f = e; e = d + temp1; \
+        d = c; c = b; b = a; a = temp1 + temp2; \
+    }
+    
+    // First 16 rounds
+    for(int i=0; i<16; ++i) {
+        SHA2_ROUND(i, w[i]);
+    }
+    
+    // Remaining 48 rounds
+    for(int i=16; i<64; ++i) {
+        WORD w_i_15 = w[(i+1) & 15];
+        WORD w_i_2  = w[(i+14) & 15];
+        WORD w_i_7  = w[(i+9) & 15];
+        WORD w_i_16 = w[i & 15];
+        
+        WORD s0 = (_rotr(w_i_15,7)) ^ (_rotr(w_i_15,18)) ^ (w_i_15 >> 3);
+        WORD s1 = (_rotr(w_i_2,17)) ^ (_rotr(w_i_2,19)) ^ (w_i_2 >> 10);
+        w[i & 15] = w_i_16 + s0 + w_i_7 + s1;
+        
+        SHA2_ROUND(i, w[i & 15]);
+    }
+    
+    #undef SHA2_ROUND
+    
+    // Final state
+    ctx->h[0] = 0x6a09e667 + a;
+    ctx->h[1] = 0xbb67ae85 + b;
+    ctx->h[2] = 0x3c6ef372 + c;
+    ctx->h[3] = 0xa54ff53a + d;
+    ctx->h[4] = 0x510e527f + e;
+    ctx->h[5] = 0x9b05688c + f;
+    ctx->h[6] = 0x1f83d9ab + g;
+    ctx->h[7] = 0x5be0cd19 + h;
+    
+    // Byte swap
+    for(int i=0; i<32; i+=4) {
+        _swap(ctx->b[i], ctx->b[i+3]);
+        _swap(ctx->b[i+1], ctx->b[i+2]);
+    }
+}
+
+
 // Unit test
 #ifdef __SHA256_UNITTEST__
 	#define print_hash(x) printf("sha256 hash: "); for(int i=0;i<32;++i)printf("%02X", (x).b[i]);

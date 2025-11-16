@@ -28,6 +28,11 @@ __host__ __device__ void sha256_transform_from_state(const WORD *state, const BY
 __host__ __device__ void sha256_finalize_from_midstate(SHA256 *ctx, const WORD midstate[8], const BYTE *last16bytes);
 __host__ __device__ void sha256_32bytes(SHA256 *ctx, const BYTE *msg32);
 
+
+__device__ void sha256_finalize_from_midstate_opt(SHA256 *ctx, const WORD midstate[8], 
+                                                    const BYTE *last16bytes);
+__device__ void sha256_32bytes_opt(SHA256 *ctx, const BYTE *msg32);
+
 #ifdef __cplusplus
 }
 #endif  //__cplusplus
