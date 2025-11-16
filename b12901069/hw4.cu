@@ -117,54 +117,41 @@ void calc_merkle_root(unsigned char *root, int count, char **branch) {
 
 // ------------------ Device Globals ------------------
 __constant__ unsigned char d_target[32];
-__constant__ WORD d_midstate[8];  // Pre-computed midstate for first 64 bytes
+__constant__ WORD d_midstate[8];
 __device__ unsigned int d_solution_nonce;
 __device__ int d_found;
 __device__ unsigned char d_solution_hash[32];
 
-// ------------------ Optimized Mining Kernel with Midstate ------------------
-__global__ void mine_kernel_midstate(const unsigned char *last12bytes, unsigned long long max_nonce_space) {
+// 1. Use constant memory for last12 (definite win, no downside)
+__constant__ unsigned char d_last12[12];
+
+// 2. Original kernel structure but with constant memory load
+__constant__ WORD d_last_words[3];
+
+__global__ void mine_kernel_midstate(unsigned long long max_nonce_space) {
     unsigned long long tid = blockIdx.x * (unsigned long long)blockDim.x + threadIdx.x;
     unsigned long long total_threads = (unsigned long long)gridDim.x * blockDim.x;
 
-    // Load last12bytes into registers once (avoid repeated global memory access)
-    unsigned char l0=last12bytes[0], l1=last12bytes[1], l2=last12bytes[2], l3=last12bytes[3];
-    unsigned char l4=last12bytes[4], l5=last12bytes[5], l6=last12bytes[6], l7=last12bytes[7];
-    unsigned char l8=last12bytes[8], l9=last12bytes[9], l10=last12bytes[10], l11=last12bytes[11];
+    WORD tail_w0 = d_last_words[0];
+    WORD tail_w1 = d_last_words[1];
+    WORD tail_w2 = d_last_words[2];
 
-    // Batch atomic checks - only check every 256 iterations to reduce contention
     int local_batch = 0;
 
     for(unsigned long long nonce = tid; nonce < max_nonce_space; nonce += total_threads) {
-        // Batched early exit check (every 256 iterations)
-        if((local_batch & 0xFF) == 0 && d_found) return;
+        if((local_batch & 0x1FF) == 0 && d_found) return;
         local_batch++;
 
-        // Build last 16 bytes directly using register values
-        unsigned char last16[16];
-        last16[0]=l0; last16[1]=l1; last16[2]=l2; last16[3]=l3;
-        last16[4]=l4; last16[5]=l5; last16[6]=l6; last16[7]=l7;
-        last16[8]=l8; last16[9]=l9; last16[10]=l10; last16[11]=l11;
+        unsigned int nonce32 = (unsigned int)nonce;
 
-        // Nonce (little-endian, 4 bytes)
-        last16[12] = (unsigned char)(nonce);
-        last16[13] = (unsigned char)(nonce >> 8);
-        last16[14] = (unsigned char)(nonce >> 16);
-        last16[15] = (unsigned char)(nonce >> 24);
+        SHA256 ctx;
+        sha256_finalize_from_midstate_opt(&ctx, d_midstate, tail_w0, tail_w1, tail_w2, nonce32);
+        sha256_32bytes_opt(&ctx, ctx.b);
 
-        // First SHA256: finalize from midstate
-        SHA256 ctx1;
-        sha256_finalize_from_midstate(&ctx1, d_midstate, last16);
-
-        // Second SHA256: optimized for 32-byte input
-        SHA256 ctx2;
-        sha256_32bytes(&ctx2, ctx1.b);
-
-        if(little_endian_bit_comparison(ctx2.b, d_target, 32) < 0) {
-            // Only update if we're first
+        if(little_endian_bit_comparison(ctx.b, d_target, 32) < 0) {
             if(atomicCAS(&d_found, 0, 1) == 0) {
                 d_solution_nonce = (unsigned int)nonce;
-                for(int i=0;i<32;++i) d_solution_hash[i] = ctx2.b[i];
+                for(int i=0;i<32;++i) d_solution_hash[i] = ctx.b[i];
             }
             return;
         }
@@ -188,42 +175,42 @@ void compute_target(unsigned char target_hex[32], unsigned int nbits_le) {
 }
 
 // ------------------ GPU Miner ------------------
+// Updated gpu_mine - just change last12 to constant memory
 bool gpu_mine(HashBlock &block, const unsigned char target_hex[32],
               unsigned int &out_nonce, unsigned char out_hash[32],
               unsigned long long max_nonce_space) {
 
-    // Compute midstate for first 64 bytes
     unsigned char first64[64];
     memcpy(first64, &block, 64);
     WORD midstate[8];
     sha256_compute_midstate(first64, midstate);
 
-    // Upload midstate and target to device
     CUDA_CALL_OR_FALSE(cudaMemcpyToSymbol(d_midstate, midstate, sizeof(midstate)));
     CUDA_CALL_OR_FALSE(cudaMemcpyToSymbol(d_target, target_hex, 32));
 
-    // Extract last 12 bytes (before nonce) - bytes 64-75
     unsigned char last12[12];
     memcpy(last12, ((unsigned char*)&block) + 64, 12);
-
-    // Upload last12 bytes to device
-    unsigned char *d_last12;
-    CUDA_CALL_OR_FALSE(cudaMalloc(&d_last12, 12));
-    CUDA_CALL_OR_FALSE(cudaMemcpy(d_last12, last12, 12, cudaMemcpyHostToDevice));
+    WORD last_words[3];
+    for(int i=0;i<3;++i) {
+        last_words[i] = ((WORD)last12[i*4] << 24) |
+                        ((WORD)last12[i*4 + 1] << 16) |
+                        ((WORD)last12[i*4 + 2] << 8) |
+                        (WORD)last12[i*4 + 3];
+    }
+    CUDA_CALL_OR_FALSE(cudaMemcpyToSymbol(d_last_words, last_words, sizeof(last_words)));
 
     int zero = 0;
     CUDA_CALL_OR_FALSE(cudaMemcpyToSymbol(d_found, &zero, sizeof(int)));
     unsigned int init_nonce = 0;
     CUDA_CALL_OR_FALSE(cudaMemcpyToSymbol(d_solution_nonce, &init_nonce, sizeof(unsigned int)));
 
-    // Increased parallelism - more threads = better GPU utilization
     int threads = 512;
     int blocks = 65535;
 
-    mine_kernel_midstate<<<blocks, threads>>>(d_last12, max_nonce_space);
+    // No more d_last12 pointer parameter!
+    mine_kernel_midstate<<<blocks, threads>>>(max_nonce_space);
+    
     cudaError_t err = cudaDeviceSynchronize();
-    cudaFree(d_last12);
-
     if(err != cudaSuccess) {
         fprintf(stderr,"Kernel failure: %s\n", cudaGetErrorString(err));
         return false;
