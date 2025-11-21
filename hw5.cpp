@@ -8,7 +8,7 @@
 #include <string>
 #include <vector>
 #include <algorithm>
-#include <thread> // Added for true parallel GPU launching
+#include <thread> 
 
 #define HIP_CHECK(err) \
     do { \
@@ -51,7 +51,7 @@ __global__ void update_mass_batched_kernel(
     const double* base_mass, const int* type, double* current_mass,
     int n, int step,
     const int* target_device_ids, 
-    double planet_orig_x, double planet_orig_y, double planet_orig_z,
+    int planet_id, // Pass ID instead of static coords to read CURRENT pos
     int* missile_hit_steps)       
 {
     int universe_idx = blockIdx.y;
@@ -68,9 +68,14 @@ __global__ void update_mass_batched_kernel(
         int target_id = target_device_ids[universe_idx];
 
         if (target_id == tid) {
-            double dx = qx[global_i] - planet_orig_x;
-            double dy = qy[global_i] - planet_orig_y;
-            double dz = qz[global_i] - planet_orig_z;
+            // FIX: Read CURRENT Planet Position
+            double px = qx[offset + planet_id];
+            double py = qy[offset + planet_id];
+            double pz = qz[offset + planet_id];
+
+            double dx = qx[global_i] - px;
+            double dy = qy[global_i] - py;
+            double dz = qz[global_i] - pz;
             double dist_sq = dx*dx + dy*dy + dz*dz;
             
             double missile_dist = (double)step * param::dt * param::missile_speed;
@@ -194,8 +199,7 @@ __global__ void check_collision_batched_kernel(
 __global__ void update_mass_single_kernel(
     const double* qx, const double* qy, const double* qz,
     const double* base_mass, const int* type, double* current_mass,
-    int n, int step,
-    double planet_orig_x, double planet_orig_y, double planet_orig_z)
+    int n, int step)
 {
     int tid = blockIdx.x * blockDim.x + threadIdx.x;
     if (tid >= n) return;
@@ -338,7 +342,7 @@ struct GpuData {
     int *d_hit_step;
 };
 
-// Problem 1 & 2 Solver (2-GPU Split for Speed)
+// Problem 1 & 2 Solver (2-GPU Split)
 std::pair<double, int> run_single_sim(
     int n, int planet, int asteroid, int n_steps,
     const std::vector<double>& h_qx, const std::vector<double>& h_qy, const std::vector<double>& h_qz,
@@ -377,10 +381,6 @@ std::pair<double, int> run_single_sim(
     HIP_CHECK(hipMemcpy(gpu1.d_base_mass, gpu0.d_base_mass, sz_d, hipMemcpyDeviceToDevice));
     HIP_CHECK(hipMemcpy(gpu1.d_type, gpu0.d_type, sz_i, hipMemcpyDeviceToDevice));
 
-    double orig_px = h_qx[planet];
-    double orig_py = h_qy[planet];
-    double orig_pz = h_qz[planet];
-
     int threads = 256;
     int blocks_all = (n + 255) / 256;
     int blocks0 = (n_gpu0 + 255) / 256;
@@ -390,12 +390,12 @@ std::pair<double, int> run_single_sim(
         HIP_CHECK(hipSetDevice(0));
         update_mass_single_kernel<<<blocks_all, threads>>>(
             gpu0.d_qx, gpu0.d_qy, gpu0.d_qz, gpu0.d_base_mass, gpu0.d_type, gpu0.d_current_mass,
-            n, s, orig_px, orig_py, orig_pz);
+            n, s);
         
         HIP_CHECK(hipSetDevice(1));
         update_mass_single_kernel<<<blocks_all, threads>>>(
             gpu1.d_qx, gpu1.d_qy, gpu1.d_qz, gpu1.d_base_mass, gpu1.d_type, gpu1.d_current_mass,
-            n, s, orig_px, orig_py, orig_pz);
+            n, s);
         
         HIP_CHECK(hipSetDevice(0)); HIP_CHECK(hipDeviceSynchronize());
         HIP_CHECK(hipSetDevice(1)); HIP_CHECK(hipDeviceSynchronize());
@@ -429,7 +429,6 @@ std::pair<double, int> run_single_sim(
 }
 
 // Problem 3 Solver (Batched independent simulations)
-// Can be run on either GPU
 void run_batch_sim(
     int device_id_gpu, 
     const std::vector<int>& batch_targets,
@@ -500,6 +499,7 @@ void run_batch_sim(
     HIP_CHECK(hipMemcpy(d_missile_steps, host_init_m.data(), batch_size * sizeof(int), hipMemcpyHostToDevice));
     HIP_CHECK(hipMemcpy(d_planet_steps, host_init_p.data(), batch_size * sizeof(int), hipMemcpyHostToDevice));
 
+    // Note: We assume missile launches from P0, but target check logic requires Current Planet Position.
     double orig_px = h_qx[planet];
     double orig_py = h_qy[planet];
     double orig_pz = h_qz[planet];
@@ -511,7 +511,7 @@ void run_batch_sim(
     for(int s=1; s<=n_steps; ++s) {
         update_mass_batched_kernel<<<grid, threads>>>(
             d_qx, d_qy, d_qz, d_base_mass, d_type, d_cur_mass,
-            n, s, d_targets, orig_px, orig_py, orig_pz, d_missile_steps);
+            n, s, d_targets, planet, d_missile_steps); // Fixed: Pass planet id
         
         compute_forces_batched_kernel<<<grid, threads>>>(
             d_qx, d_qy, d_qz, d_vx, d_vy, d_vz, d_cur_mass, n);
@@ -578,7 +578,6 @@ int main(int argc, char** argv) {
         std::vector<int> m_steps0(batch0.size()), p_steps0(batch0.size());
         std::vector<int> m_steps1(batch1.size()), p_steps1(batch1.size());
 
-        // Use threads to launch batches on GPU 0 and GPU 1 simultaneously
         std::thread t0([&]() {
             run_batch_sim(0, batch0, n, planet, asteroid, param::n_steps, qx, qy, qz, vx, vy, vz, m, type, m_steps0.data(), p_steps0.data());
         });
@@ -608,7 +607,6 @@ int main(int argc, char** argv) {
         check_results(batch1, m_steps1, p_steps1);
     }
 
-    // FIX: If no device could save the planet (or collision didn't happen), output -1 0
     if (best_device_id == -1) {
         min_cost = 0;
     }
