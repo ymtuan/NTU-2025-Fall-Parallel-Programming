@@ -17,9 +17,6 @@
         } \
     } while (0)
 
-// ---------------------------------------------------------
-// CONSTANTS
-// ---------------------------------------------------------
 struct SimParams {
     int n;
     int n_steps;
@@ -37,15 +34,13 @@ __constant__ SimParams d_params;
 const int TYPE_NORMAL = 0;
 const int TYPE_DEVICE = 1;
 const int CKPT_INTERVAL = 1000;
-// Assuming N <= 1024 as per "large testcase" description.
-// This allows Single-Block Synchronization.
 #define MAX_N 1024 
+// Threshold to switch between Single-Block (Low Latency) and Multi-Block (High Throughput)
+#define HYBRID_THRESHOLD 512 
 
 // ---------------------------------------------------------
-// DEVICE FUNCTIONS
+// DEVICE HELPERS
 // ---------------------------------------------------------
-
-// Helper for atomic Min on doubles
 __device__ __forceinline__ void atomicMinDouble(double* addr, double value) {
     unsigned long long* addr_as_ull = (unsigned long long*)addr;
     unsigned long long old = *addr_as_ull, assumed;
@@ -57,12 +52,86 @@ __device__ __forceinline__ void atomicMinDouble(double* addr, double value) {
 }
 
 // ---------------------------------------------------------
-// KERNELS
+// KERNEL 1: MULTI-BLOCK PARALLEL (Best for Large N)
 // ---------------------------------------------------------
+__global__ void step_kernel_parallel(
+    const double* __restrict__ qx_in, const double* __restrict__ qy_in, const double* __restrict__ qz_in,
+    const double* __restrict__ vx_in, const double* __restrict__ vy_in, const double* __restrict__ vz_in,
+    double* __restrict__ qx_out, double* __restrict__ qy_out, double* __restrict__ qz_out,
+    double* __restrict__ vx_out, double* __restrict__ vy_out, double* __restrict__ vz_out,
+    const double* __restrict__ mass, 
+    const int* __restrict__ type,
+    int step,
+    bool is_p1
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int n = d_params.n;
+    if (i >= n) return;
 
-// FUSED INTERVAL KERNEL (P1 & P2)
-// Runs CKPT_INTERVAL steps completely inside the kernel without global memory IO for intermediate steps.
-__global__ void run_interval_kernel(
+    double my_qx = qx_in[i];
+    double my_qy = qy_in[i];
+    double my_qz = qz_in[i];
+    double my_vx = vx_in[i];
+    double my_vy = vy_in[i];
+    double my_vz = vz_in[i];
+
+    double ax = 0.0, ay = 0.0, az = 0.0;
+    
+    __shared__ double s_qx[256];
+    __shared__ double s_qy[256];
+    __shared__ double s_qz[256];
+    __shared__ double s_m[256];
+
+    double eps_sq = d_params.eps * d_params.eps;
+    double G = d_params.G;
+    double dt = d_params.dt;
+
+    for (int tile = 0; tile < (n + 255) / 256; tile++) {
+        int idx = tile * 256 + threadIdx.x;
+        if (idx < n) {
+            s_qx[threadIdx.x] = qx_in[idx];
+            s_qy[threadIdx.x] = qy_in[idx];
+            s_qz[threadIdx.x] = qz_in[idx];
+            double m_val = mass[idx];
+            if (type[idx] == TYPE_DEVICE) {
+                if (is_p1) m_val = 0.0;
+                else {
+                    double t = (double)step * dt;
+                    m_val = m_val + 0.5 * m_val * fabs(sin(t / 6000.0));
+                }
+            }
+            s_m[threadIdx.x] = m_val;
+        } else {
+            s_m[threadIdx.x] = 0.0;
+        }
+        __syncthreads();
+
+        #pragma unroll 8
+        for (int j = 0; j < 256; j++) {
+            int j_idx = tile * 256 + j;
+            if (j_idx >= n) break;
+            double dx = s_qx[j] - my_qx;
+            double dy = s_qy[j] - my_qy;
+            double dz = s_qz[j] - my_qz;
+            double dist_sq = dx*dx + dy*dy + dz*dz + eps_sq;
+            double dist_inv3 = rsqrt(dist_sq * dist_sq * dist_sq);
+            double f = G * s_m[j] * dist_inv3;
+            ax += f * dx; ay += f * dy; az += f * dz;
+        }
+        __syncthreads();
+    }
+
+    double new_vx = my_vx + ax * dt;
+    double new_vy = my_vy + ay * dt;
+    double new_vz = my_vz + az * dt;
+    vx_out[i] = new_vx; vy_out[i] = new_vy; vz_out[i] = new_vz;
+    qx_out[i] = my_qx + new_vx * dt; qy_out[i] = my_qy + new_vy * dt; qz_out[i] = my_qz + new_vz * dt;
+}
+
+// ---------------------------------------------------------
+// KERNEL 2: SINGLE-BLOCK FUSED INTERVAL (Best for Small N)
+// ---------------------------------------------------------
+__global__ void run_interval_kernel_single_block(
     const double* __restrict__ qx_in, const double* __restrict__ qy_in, const double* __restrict__ qz_in,
     const double* __restrict__ vx_in, const double* __restrict__ vy_in, const double* __restrict__ vz_in,
     double* __restrict__ qx_out, double* __restrict__ qy_out, double* __restrict__ qz_out,
@@ -74,13 +143,11 @@ __global__ void run_interval_kernel(
     bool is_p1,
     double* d_min_dist,
     int* d_hit_step,
-    int* d_device_destroy_steps // Only used if !is_p1
+    int* d_device_destroy_steps
 ) {
-    // We use 1 block per simulation universe. Thread ID = Body ID.
     int i = threadIdx.x;
     int n = d_params.n;
     
-    // 1. Load State into Registers
     double my_qx = (i < n) ? qx_in[i] : 0.0;
     double my_qy = (i < n) ? qy_in[i] : 0.0;
     double my_qz = (i < n) ? qz_in[i] : 0.0;
@@ -90,7 +157,6 @@ __global__ void run_interval_kernel(
     double my_m_base = (i < n) ? mass_base[i] : 0.0;
     int my_type    = (i < n) ? type[i] : TYPE_NORMAL;
 
-    // Shared Memory for Tiling
     __shared__ double s_qx[MAX_N];
     __shared__ double s_qy[MAX_N];
     __shared__ double s_qz[MAX_N];
@@ -100,157 +166,107 @@ __global__ void run_interval_kernel(
     double G = d_params.G;
     double dt = d_params.dt;
 
-    // Time Loop
     for (int k = 0; k < n_steps_to_run; k++) {
         int current_step = start_step + k;
         
-        // A. Load data into Shared Memory for all-to-all interaction
-        // Since N <= 1024, we can load the entire system state if blockDim >= N
         if (i < n) {
-            s_qx[i] = my_qx;
-            s_qy[i] = my_qy;
-            s_qz[i] = my_qz;
-            
-            // Calculate current mass
+            s_qx[i] = my_qx; s_qy[i] = my_qy; s_qz[i] = my_qz;
             double m_val = my_m_base;
             if (my_type == TYPE_DEVICE) {
-                if (is_p1) {
-                    m_val = 0.0;
-                } else {
+                if (is_p1) m_val = 0.0;
+                else {
                     double t = (double)current_step * dt;
                     m_val = m_val + 0.5 * m_val * fabs(sin(t / 6000.0));
                 }
             }
             s_m[i] = m_val;
         } else {
-            // Padding for threads beyond N
             s_m[i] = 0.0; 
         }
-        
-        // Sync to ensure shared memory is ready
         __syncthreads();
 
-        // B. Compute Forces (Register Tiling / Accumulation)
         if (i < n) {
             double ax = 0.0, ay = 0.0, az = 0.0;
-
             #pragma unroll 16
             for (int j = 0; j < n; j++) {
                 double dx = s_qx[j] - my_qx;
                 double dy = s_qy[j] - my_qy;
                 double dz = s_qz[j] - my_qz;
-                
                 double dist_sq = dx*dx + dy*dy + dz*dz + eps_sq;
                 double dist_inv3 = rsqrt(dist_sq * dist_sq * dist_sq);
                 double f = G * s_m[j] * dist_inv3;
-
-                ax += f * dx;
-                ay += f * dy;
-                az += f * dz;
+                ax += f * dx; ay += f * dy; az += f * dz;
             }
+            my_vx += ax * dt; my_vy += ay * dt; my_vz += az * dt;
+            my_qx += my_vx * dt; my_qy += my_vy * dt; my_qz += my_vz * dt;
 
-            // C. Update State
-            my_vx += ax * dt;
-            my_vy += ay * dt;
-            my_vz += az * dt;
-            
-            // We update position in a temp variable first? 
-            // Standard Euler-Cromer or similar uses new velocity for new position immediately
-            my_qx += my_vx * dt;
-            my_qy += my_vy * dt;
-            my_qz += my_vz * dt;
-
-            // D. Collision & Missile Checks (Only Thread 0 or distributed)
-            // Min Dist check (thread 0 handles planet-asteroid check)
+            // Collision Check (Inside Loop)
             if (i == 0) {
                 int pid = d_params.planet_id;
                 int aid = d_params.asteroid_id;
-                // Read from shared mem for consistency within step
                 double dx = s_qx[pid] - s_qx[aid];
                 double dy = s_qy[pid] - s_qy[aid];
                 double dz = s_qz[pid] - s_qz[aid];
-                
-                // Note: s_qx is OLD position. The updated position is in my_qx.
-                // For correctness, we should technically check the NEW position.
-                // However, thread 0's my_qx is only valid for body 0.
-                // For simplicity and speed, we can check using the registers IF thread 0 is planet or asteroid.
-                // BUT, to be safe, we perform the check on the NEXT load phase or sync?
-                // Actually, let's just check the *updated* local body against the others using global atomics 
-                // but that's slow.
-                
-                // Better approach: Since 1 block has all data, we can check collision
-                // *after* a sync if we wrote back to shared memory.
-                // But writing back to shared memory every step costs a sync.
-                // Optimization: Just check collision using the old positions in s_qx (Start of Step).
-                // Or: Check collision at the VERY END of the loop? No, need per-step accuracy.
-                
-                // FAST APPROX for this architecture:
-                // We assume planet/asteroid are within the first 1024 bodies (guaranteed).
-                // We can't access other threads' registers.
-                // We MUST rely on the data in Shared Memory (Start of Step) for the check.
-                // This effectively checks collision at step T, then updates to T+1. 
-                // This is valid.
-                
-                double dist_sq = dx*dx + dy*dy + dz*dz;
-                double dist = sqrt(dist_sq);
+                double dist = sqrt(dx*dx + dy*dy + dz*dz);
                 atomicMinDouble(d_min_dist, dist);
                 if (dist < d_params.planet_radius) {
-                    // Record the earliest hit
                     int old = atomicCAS(d_hit_step, -2, current_step);
                     if (old != -2) atomicMin(d_hit_step, current_step);
                 }
             }
 
-            // Missile Check (All threads check themselves)
+            // Missile Check
             if (!is_p1 && d_device_destroy_steps && my_type == TYPE_DEVICE) {
-                 // Check if missile hits ME (body i) at current_step
-                 // Use shared memory for planet position (pid)
                  int pid = d_params.planet_id;
-                 double px = s_qx[pid];
-                 double py = s_qy[pid];
-                 double pz = s_qz[pid]; // Planet pos at start of step
-                 
-                 // My pos at start of step
-                 double mx = s_qx[i]; 
-                 double my = s_qy[i];
-                 double mz = s_qz[i];
-
-                 double dx = mx - px;
-                 double dy = my - py;
-                 double dz = mz - pz;
+                 double dx = s_qx[i] - s_qx[pid];
+                 double dy = s_qy[i] - s_qy[pid];
+                 double dz = s_qz[i] - s_qz[pid];
                  double dist_sq = dx*dx + dy*dy + dz*dz;
-                 
                  double m_dist = (double)current_step * dt * d_params.missile_speed;
                  if (m_dist * m_dist > dist_sq) {
-                     // Hit!
                      int old = d_device_destroy_steps[i];
                      if (old == -1) d_device_destroy_steps[i] = current_step;
                  }
             }
         }
-        
-        // Barrier before next step loads new data
         __syncthreads();
     }
 
-    // 2. Write Final State to Global Memory
     if (i < n) {
-        qx_out[i] = my_qx;
-        qy_out[i] = my_qy;
-        qz_out[i] = my_qz;
-        vx_out[i] = my_vx;
-        vy_out[i] = my_vy;
-        vz_out[i] = my_vz;
+        qx_out[i] = my_qx; qy_out[i] = my_qy; qz_out[i] = my_qz;
+        vx_out[i] = my_vx; vy_out[i] = my_vy; vz_out[i] = my_vz;
     }
 }
 
+// Helpers for Multi-Block mode
+__global__ void check_hit_kernel(const double* qx, const double* qy, const double* qz, int step, double* d_min_dist, int* d_hit_step) {
+    if (threadIdx.x != 0) return;
+    int pid = d_params.planet_id; int aid = d_params.asteroid_id;
+    double dx = qx[pid] - qx[aid]; double dy = qy[pid] - qy[aid]; double dz = qz[pid] - qz[aid];
+    double dist = sqrt(dx*dx + dy*dy + dz*dz);
+    if(d_min_dist) atomicMinDouble(d_min_dist, dist);
+    if (dist < d_params.planet_radius) atomicCAS(d_hit_step, -2, step);
+}
 
-// BATCHED P3 KERNEL
-// Each Block simulates ONE Task (one universe)
+__global__ void check_missile_kernel_parallel(const double* qx, const double* qy, const double* qz, const int* type, int step, int* d_dest) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= d_params.n) return;
+    if (type[i] == TYPE_DEVICE && d_dest[i] == -1) {
+        int pid = d_params.planet_id;
+        double dx = qx[i] - qx[pid]; double dy = qy[i] - qy[pid]; double dz = qz[i] - qz[pid];
+        double dist_sq = dx*dx + dy*dy + dz*dz;
+        double m_dist = (double)step * d_params.dt * d_params.missile_speed;
+        if (m_dist * m_dist > dist_sq) d_dest[i] = step;
+    }
+}
+
+// ---------------------------------------------------------
+// KERNEL 3: BATCHED P3 (Unchanged - Parallel is always best for batching)
+// ---------------------------------------------------------
 __global__ void run_p3_batch_kernel(
-    const double* __restrict__ ckpt_data, // Flattened checkpoints
-    const int* __restrict__ tasks_info,   // [id, destroy_step, ckpt_idx] * n_tasks
-    int* __restrict__ results,            // hit_step output per task
+    const double* __restrict__ ckpt_data, 
+    const int* __restrict__ tasks_info,   
+    int* __restrict__ results,           
     const double* __restrict__ mass_base,
     const int* __restrict__ type,
     int n_tasks,
@@ -258,17 +274,11 @@ __global__ void run_p3_batch_kernel(
 ) {
     int task_idx = blockIdx.x;
     if (task_idx >= n_tasks) return;
+    int i = threadIdx.x;
 
-    int i = threadIdx.x; // Body ID
-    
-    // Unpack Task
     int target_id = tasks_info[task_idx * 3 + 0];
     int destroy_step = tasks_info[task_idx * 3 + 1];
-    int ckpt_idx = tasks_info[task_idx * 3 + 2]; // Index into ckpt array (not step)
-    
-    // Load Checkpoint State into Registers
-    // ckpt_data layout: [ckpt_idx][component 0-5][body_id]
-    // components: qx, qy, qz, vx, vy, vz
+    int ckpt_idx = tasks_info[task_idx * 3 + 2];
     int offset = ckpt_idx * 6 * n_bodies;
     
     double my_qx = (i < n_bodies) ? ckpt_data[offset + 0*n_bodies + i] : 0.0;
@@ -280,12 +290,9 @@ __global__ void run_p3_batch_kernel(
     double my_m_base = (i < n_bodies) ? mass_base[i] : 0.0;
     int my_type = (i < n_bodies) ? type[i] : TYPE_NORMAL;
 
-    // Checkpoint step is implied? We need to know start step.
-    // We can compute start step from ckpt_idx * INTERVAL.
     int current_step = ckpt_idx * CKPT_INTERVAL;
     int end_step = d_params.n_steps;
 
-    // Shared Memory
     __shared__ double s_qx[MAX_N];
     __shared__ double s_qy[MAX_N];
     __shared__ double s_qz[MAX_N];
@@ -299,129 +306,82 @@ __global__ void run_p3_batch_kernel(
     double G = d_params.G;
     double dt = d_params.dt;
 
-    // Simulation Loop
     for (int s = current_step; s <= end_step; s++) {
-        // A. Load Shared
         if (i < n_bodies) {
-            s_qx[i] = my_qx;
-            s_qy[i] = my_qy;
-            s_qz[i] = my_qz;
-            
+            s_qx[i] = my_qx; s_qy[i] = my_qy; s_qz[i] = my_qz;
             double m_val = my_m_base;
             if (my_type == TYPE_DEVICE) {
-                // Check destruction
-                if (i == target_id && s >= destroy_step) {
-                    m_val = 0.0;
-                } else {
+                if (i == target_id && s >= destroy_step) m_val = 0.0;
+                else {
                     double t = (double)s * dt;
                     m_val = m_val + 0.5 * m_val * fabs(sin(t / 6000.0));
                 }
             }
             s_m[i] = m_val;
-        } else {
-            s_m[i] = 0.0;
-        }
+        } else { s_m[i] = 0.0; }
         __syncthreads();
 
-        // B. Collision Check (at start of step state)
         if (i == 0) {
-            int pid = d_params.planet_id;
-            int aid = d_params.asteroid_id;
-            double dx = s_qx[pid] - s_qx[aid];
-            double dy = s_qy[pid] - s_qy[aid];
-            double dz = s_qz[pid] - s_qz[aid];
+            int pid = d_params.planet_id; int aid = d_params.asteroid_id;
+            double dx = s_qx[pid] - s_qx[aid]; double dy = s_qy[pid] - s_qy[aid]; double dz = s_qz[pid] - s_qz[aid];
             if ((dx*dx + dy*dy + dz*dz) < (d_params.planet_radius * d_params.planet_radius)) {
                 if (s_hit == -2) s_hit = s; 
             }
         }
         __syncthreads();
         
-        // Early Exit if Hit Found
         if (s_hit != -2) break;
 
-        // C. Compute Forces
         if (i < n_bodies) {
             double ax = 0.0, ay = 0.0, az = 0.0;
             #pragma unroll 16
             for (int j = 0; j < n_bodies; j++) {
-                double dx = s_qx[j] - my_qx;
-                double dy = s_qy[j] - my_qy;
-                double dz = s_qz[j] - my_qz;
+                double dx = s_qx[j] - my_qx; double dy = s_qy[j] - my_qy; double dz = s_qz[j] - my_qz;
                 double dist_sq = dx*dx + dy*dy + dz*dz + eps_sq;
                 double dist_inv3 = rsqrt(dist_sq * dist_sq * dist_sq);
                 double f = G * s_m[j] * dist_inv3;
                 ax += f * dx; ay += f * dy; az += f * dz;
             }
-            my_vx += ax * dt;
-            my_vy += ay * dt;
-            my_vz += az * dt;
-            my_qx += my_vx * dt;
-            my_qy += my_vy * dt;
-            my_qz += my_vz * dt;
+            my_vx += ax * dt; my_vy += ay * dt; my_vz += az * dt;
+            my_qx += my_vx * dt; my_qy += my_vy * dt; my_qz += my_vz * dt;
         }
         __syncthreads();
     }
-
-    if (i == 0) {
-        results[task_idx] = s_hit;
-    }
+    if (i == 0) results[task_idx] = s_hit;
 }
 
 // ---------------------------------------------------------
-// HOST CLASS
+// SIMULATOR
 // ---------------------------------------------------------
 class Simulator {
-    int device_id;
-    int n;
-    SimParams params;
-    
-    double *d_qx[2], *d_qy[2], *d_qz[2];
-    double *d_vx[2], *d_vy[2], *d_vz[2];
-    double *d_mass;
-    int *d_type;
-    
-    double *d_min_dist;
-    int *d_hit_step;
-    int *d_device_destroy_steps;
-
-    // For P3 Batching
-    double *d_flat_ckpts;
-    int *d_tasks;
-    int *d_results;
+    int device_id; int n; SimParams params;
+    double *d_qx[2], *d_qy[2], *d_qz[2], *d_vx[2], *d_vy[2], *d_vz[2];
+    double *d_mass; int *d_type;
+    double *d_min_dist; int *d_hit_step; int *d_device_destroy_steps;
+    double *d_flat_ckpts; int *d_tasks; int *d_results;
 
 public:
-    Simulator(int dev_id, const SimParams& p, 
-              const std::vector<double>& h_m, const std::vector<int>& h_t) 
-        : device_id(dev_id), n(p.n), params(p) 
-    {
+    Simulator(int dev_id, const SimParams& p, const std::vector<double>& h_m, const std::vector<int>& h_t) 
+        : device_id(dev_id), n(p.n), params(p) {
         HIP_CHECK(hipSetDevice(device_id));
         HIP_CHECK(hipMemcpyToSymbol(d_params, &params, sizeof(SimParams)));
-
         size_t sz_d = n * sizeof(double);
         for(int i=0; i<2; i++) {
             HIP_CHECK(hipMalloc(&d_qx[i], sz_d)); HIP_CHECK(hipMalloc(&d_qy[i], sz_d)); HIP_CHECK(hipMalloc(&d_qz[i], sz_d));
             HIP_CHECK(hipMalloc(&d_vx[i], sz_d)); HIP_CHECK(hipMalloc(&d_vy[i], sz_d)); HIP_CHECK(hipMalloc(&d_vz[i], sz_d));
         }
-        HIP_CHECK(hipMalloc(&d_mass, sz_d));
-        HIP_CHECK(hipMemcpy(d_mass, h_m.data(), sz_d, hipMemcpyHostToDevice));
-        HIP_CHECK(hipMalloc(&d_type, n * sizeof(int)));
-        HIP_CHECK(hipMemcpy(d_type, h_t.data(), n * sizeof(int), hipMemcpyHostToDevice));
-        HIP_CHECK(hipMalloc(&d_min_dist, sizeof(double)));
-        HIP_CHECK(hipMalloc(&d_hit_step, sizeof(int)));
+        HIP_CHECK(hipMalloc(&d_mass, sz_d)); HIP_CHECK(hipMemcpy(d_mass, h_m.data(), sz_d, hipMemcpyHostToDevice));
+        HIP_CHECK(hipMalloc(&d_type, n * sizeof(int))); HIP_CHECK(hipMemcpy(d_type, h_t.data(), n * sizeof(int), hipMemcpyHostToDevice));
+        HIP_CHECK(hipMalloc(&d_min_dist, sizeof(double))); HIP_CHECK(hipMalloc(&d_hit_step, sizeof(int)));
         HIP_CHECK(hipMalloc(&d_device_destroy_steps, n * sizeof(int)));
     }
 
-    // Run P1/P2
-    std::pair<double, int> run_main(
-        const std::vector<double>& h_qx, const std::vector<double>& h_qy, const std::vector<double>& h_qz,
+    std::pair<double, int> run_main(const std::vector<double>& h_qx, const std::vector<double>& h_qy, const std::vector<double>& h_qz,
         const std::vector<double>& h_vx, const std::vector<double>& h_vy, const std::vector<double>& h_vz,
-        bool is_p1,
-        std::vector<double>* flat_checkpoints = nullptr, // Output for P2
-        std::vector<int>* device_destroy_steps_out = nullptr
-    ) {
+        bool is_p1, std::vector<double>* flat_checkpoints = nullptr, std::vector<int>* device_destroy_steps_out = nullptr) 
+    {
         HIP_CHECK(hipSetDevice(device_id));
         size_t sz_d = n * sizeof(double);
-        
         HIP_CHECK(hipMemcpy(d_qx[0], h_qx.data(), sz_d, hipMemcpyHostToDevice));
         HIP_CHECK(hipMemcpy(d_qy[0], h_qy.data(), sz_d, hipMemcpyHostToDevice));
         HIP_CHECK(hipMemcpy(d_qz[0], h_qz.data(), sz_d, hipMemcpyHostToDevice));
@@ -429,8 +389,7 @@ public:
         HIP_CHECK(hipMemcpy(d_vy[0], h_vy.data(), sz_d, hipMemcpyHostToDevice));
         HIP_CHECK(hipMemcpy(d_vz[0], h_vz.data(), sz_d, hipMemcpyHostToDevice));
 
-        double inf = std::numeric_limits<double>::infinity();
-        int no_hit = -2;
+        double inf = std::numeric_limits<double>::infinity(); int no_hit = -2;
         HIP_CHECK(hipMemcpy(d_min_dist, &inf, sizeof(double), hipMemcpyHostToDevice));
         HIP_CHECK(hipMemcpy(d_hit_step, &no_hit, sizeof(int), hipMemcpyHostToDevice));
 
@@ -441,14 +400,9 @@ public:
 
         int in = 0, out = 1;
         int n_ckpts = (params.n_steps / CKPT_INTERVAL) + 1;
-        
         if (flat_checkpoints) {
-            // Resize flattened checkpionts: [ckpt][6][n]
             flat_checkpoints->resize(n_ckpts * 6 * n);
-            // Save step 0
-            int offset = 0;
-            // Helper to copy 6 arrays
-             auto copy_state = [&](int buf_idx, int ckpt_idx) {
+            auto copy_state = [&](int buf_idx, int ckpt_idx) {
                 int base = ckpt_idx * 6 * n;
                 HIP_CHECK(hipMemcpy(&(*flat_checkpoints)[base + 0*n], d_qx[buf_idx], sz_d, hipMemcpyDeviceToHost));
                 HIP_CHECK(hipMemcpy(&(*flat_checkpoints)[base + 1*n], d_qy[buf_idx], sz_d, hipMemcpyDeviceToHost));
@@ -460,40 +414,59 @@ public:
             copy_state(0, 0); 
         }
 
-        // Main Loop: Launch Intervals
-        for (int s = 0; s < params.n_steps; s += CKPT_INTERVAL) {
-            int steps_to_run = std::min(CKPT_INTERVAL, params.n_steps - s);
-            
-            run_interval_kernel<<<1, 1024>>>(
-                d_qx[in], d_qy[in], d_qz[in], d_vx[in], d_vy[in], d_vz[in],
-                d_qx[out], d_qy[out], d_qz[out], d_vx[out], d_vy[out], d_vz[out],
-                d_mass, d_type,
-                s + 1, // Start step number (exclusive of current state)
-                steps_to_run,
-                is_p1, d_min_dist, d_hit_step, d_device_destroy_steps
-            );
-            
-            // If saving checkpoints, copy back
-            if (flat_checkpoints) {
-                HIP_CHECK(hipDeviceSynchronize());
-                // Save state at s + steps_to_run
-                int ckpt_idx = (s + steps_to_run) / CKPT_INTERVAL;
-                // Helper to copy
-                int base = ckpt_idx * 6 * n;
-                HIP_CHECK(hipMemcpy(&(*flat_checkpoints)[base + 0*n], d_qx[out], sz_d, hipMemcpyDeviceToHost));
-                HIP_CHECK(hipMemcpy(&(*flat_checkpoints)[base + 1*n], d_qy[out], sz_d, hipMemcpyDeviceToHost));
-                HIP_CHECK(hipMemcpy(&(*flat_checkpoints)[base + 2*n], d_qz[out], sz_d, hipMemcpyDeviceToHost));
-                HIP_CHECK(hipMemcpy(&(*flat_checkpoints)[base + 3*n], d_vx[out], sz_d, hipMemcpyDeviceToHost));
-                HIP_CHECK(hipMemcpy(&(*flat_checkpoints)[base + 4*n], d_vy[out], sz_d, hipMemcpyDeviceToHost));
-                HIP_CHECK(hipMemcpy(&(*flat_checkpoints)[base + 5*n], d_vz[out], sz_d, hipMemcpyDeviceToHost));
+        // HYBRID DISPATCH
+        if (n < HYBRID_THRESHOLD) {
+            // Use Fused Interval Kernel (Low Latency)
+            for (int s = 0; s < params.n_steps; s += CKPT_INTERVAL) {
+                int steps = std::min(CKPT_INTERVAL, params.n_steps - s);
+                run_interval_kernel_single_block<<<1, 1024>>>(
+                    d_qx[in], d_qy[in], d_qz[in], d_vx[in], d_vy[in], d_vz[in],
+                    d_qx[out], d_qy[out], d_qz[out], d_vx[out], d_vy[out], d_vz[out],
+                    d_mass, d_type, s + 1, steps, is_p1, d_min_dist, d_hit_step, d_device_destroy_steps);
+                
+                if (flat_checkpoints) {
+                    HIP_CHECK(hipDeviceSynchronize());
+                    int ckpt_idx = (s + steps) / CKPT_INTERVAL;
+                    int base = ckpt_idx * 6 * n;
+                    HIP_CHECK(hipMemcpy(&(*flat_checkpoints)[base + 0*n], d_qx[out], sz_d, hipMemcpyDeviceToHost));
+                    HIP_CHECK(hipMemcpy(&(*flat_checkpoints)[base + 1*n], d_qy[out], sz_d, hipMemcpyDeviceToHost));
+                    HIP_CHECK(hipMemcpy(&(*flat_checkpoints)[base + 2*n], d_qz[out], sz_d, hipMemcpyDeviceToHost));
+                    HIP_CHECK(hipMemcpy(&(*flat_checkpoints)[base + 3*n], d_vx[out], sz_d, hipMemcpyDeviceToHost));
+                    HIP_CHECK(hipMemcpy(&(*flat_checkpoints)[base + 4*n], d_vy[out], sz_d, hipMemcpyDeviceToHost));
+                    HIP_CHECK(hipMemcpy(&(*flat_checkpoints)[base + 5*n], d_vz[out], sz_d, hipMemcpyDeviceToHost));
+                }
+                std::swap(in, out);
             }
-            std::swap(in, out);
+        } else {
+            // Use Multi-Block Kernel (High Throughput)
+            int blocks = (n + 255) / 256;
+            for (int s = 1; s <= params.n_steps; s++) {
+                step_kernel_parallel<<<blocks, 256>>>(
+                    d_qx[in], d_qy[in], d_qz[in], d_vx[in], d_vy[in], d_vz[in],
+                    d_qx[out], d_qy[out], d_qz[out], d_vx[out], d_vy[out], d_vz[out],
+                    d_mass, d_type, s, is_p1);
+                
+                check_hit_kernel<<<1, 1>>>(d_qx[out], d_qy[out], d_qz[out], s, d_min_dist, d_hit_step);
+                if (!is_p1 && device_destroy_steps_out) check_missile_kernel_parallel<<<blocks, 256>>>(d_qx[out], d_qy[out], d_qz[out], d_type, s, d_device_destroy_steps);
+
+                if (flat_checkpoints && (s % CKPT_INTERVAL == 0)) {
+                    HIP_CHECK(hipDeviceSynchronize());
+                    int ckpt_idx = s / CKPT_INTERVAL;
+                    int base = ckpt_idx * 6 * n;
+                    HIP_CHECK(hipMemcpy(&(*flat_checkpoints)[base + 0*n], d_qx[out], sz_d, hipMemcpyDeviceToHost));
+                    HIP_CHECK(hipMemcpy(&(*flat_checkpoints)[base + 1*n], d_qy[out], sz_d, hipMemcpyDeviceToHost));
+                    HIP_CHECK(hipMemcpy(&(*flat_checkpoints)[base + 2*n], d_qz[out], sz_d, hipMemcpyDeviceToHost));
+                    HIP_CHECK(hipMemcpy(&(*flat_checkpoints)[base + 3*n], d_vx[out], sz_d, hipMemcpyDeviceToHost));
+                    HIP_CHECK(hipMemcpy(&(*flat_checkpoints)[base + 4*n], d_vy[out], sz_d, hipMemcpyDeviceToHost));
+                    HIP_CHECK(hipMemcpy(&(*flat_checkpoints)[base + 5*n], d_vz[out], sz_d, hipMemcpyDeviceToHost));
+                }
+                std::swap(in, out);
+            }
         }
 
         double h_min; int h_hit;
         HIP_CHECK(hipMemcpy(&h_min, d_min_dist, sizeof(double), hipMemcpyDeviceToHost));
         HIP_CHECK(hipMemcpy(&h_hit, d_hit_step, sizeof(int), hipMemcpyDeviceToHost));
-
         if (device_destroy_steps_out) {
             device_destroy_steps_out->resize(n);
             HIP_CHECK(hipMemcpy(device_destroy_steps_out->data(), d_device_destroy_steps, n*sizeof(int), hipMemcpyDeviceToHost));
@@ -501,134 +474,79 @@ public:
         return {h_min, h_hit};
     }
 
-    // Run Batch P3
-    void run_batch_p3(
-        const std::vector<double>& flat_checkpoints,
-        const std::vector<int>& tasks_info, // [id, destroy_step, ckpt_idx]
-        std::vector<int>& results_out
-    ) {
+    void run_batch_p3(const std::vector<double>& flat_checkpoints, const std::vector<int>& tasks_info, std::vector<int>& results_out) {
         if (tasks_info.empty()) return;
         HIP_CHECK(hipSetDevice(device_id));
-
         int n_tasks = tasks_info.size() / 3;
         results_out.resize(n_tasks);
-
-        // Upload Checkpoints
         size_t sz_ckpts = flat_checkpoints.size() * sizeof(double);
-        HIP_CHECK(hipMalloc(&d_flat_ckpts, sz_ckpts));
-        HIP_CHECK(hipMemcpy(d_flat_ckpts, flat_checkpoints.data(), sz_ckpts, hipMemcpyHostToDevice));
-
-        // Upload Tasks
+        HIP_CHECK(hipMalloc(&d_flat_ckpts, sz_ckpts)); HIP_CHECK(hipMemcpy(d_flat_ckpts, flat_checkpoints.data(), sz_ckpts, hipMemcpyHostToDevice));
         size_t sz_tasks = tasks_info.size() * sizeof(int);
-        HIP_CHECK(hipMalloc(&d_tasks, sz_tasks));
-        HIP_CHECK(hipMemcpy(d_tasks, tasks_info.data(), sz_tasks, hipMemcpyHostToDevice));
-
-        // Alloc Results
+        HIP_CHECK(hipMalloc(&d_tasks, sz_tasks)); HIP_CHECK(hipMemcpy(d_tasks, tasks_info.data(), sz_tasks, hipMemcpyHostToDevice));
         HIP_CHECK(hipMalloc(&d_results, n_tasks * sizeof(int)));
-
-        // Launch Massive Grid
-        // 1 Block per Task.
-        run_p3_batch_kernel<<<n_tasks, 1024>>>(
-            d_flat_ckpts, d_tasks, d_results,
-            d_mass, d_type, n_tasks, n
-        );
+        run_p3_batch_kernel<<<n_tasks, 1024>>>(d_flat_ckpts, d_tasks, d_results, d_mass, d_type, n_tasks, n);
         HIP_CHECK(hipDeviceSynchronize());
-
         HIP_CHECK(hipMemcpy(results_out.data(), d_results, n_tasks * sizeof(int), hipMemcpyDeviceToHost));
-
-        HIP_CHECK(hipFree(d_flat_ckpts));
-        HIP_CHECK(hipFree(d_tasks));
-        HIP_CHECK(hipFree(d_results));
+        HIP_CHECK(hipFree(d_flat_ckpts)); HIP_CHECK(hipFree(d_tasks)); HIP_CHECK(hipFree(d_results));
     }
 };
 
-// ---------------------------------------------------------
-// MAIN
-// ---------------------------------------------------------
-void read_input(const char* filename, int& n, int& planet, int& asteroid,
-    std::vector<double>& qx, std::vector<double>& qy, std::vector<double>& qz,
-    std::vector<double>& vx, std::vector<double>& vy, std::vector<double>& vz,
-    std::vector<double>& m, std::vector<int>& type, std::vector<int>& device_ids) {
-    std::ifstream fin(filename);
-    if (!fin.is_open()) exit(1);
+void read_input(const char* filename, int& n, int& planet, int& asteroid, std::vector<double>& qx, std::vector<double>& qy, std::vector<double>& qz, std::vector<double>& vx, std::vector<double>& vy, std::vector<double>& vz, std::vector<double>& m, std::vector<int>& type, std::vector<int>& device_ids) {
+    std::ifstream fin(filename); if (!fin.is_open()) exit(1);
     fin >> n >> planet >> asteroid;
-    qx.resize(n); qy.resize(n); qz.resize(n);
-    vx.resize(n); vy.resize(n); vz.resize(n);
-    m.resize(n); type.resize(n);
+    qx.resize(n); qy.resize(n); qz.resize(n); vx.resize(n); vy.resize(n); vz.resize(n); m.resize(n); type.resize(n);
     for (int i = 0; i < n; i++) {
-        std::string t_str;
-        fin >> qx[i] >> qy[i] >> qz[i] >> vx[i] >> vy[i] >> vz[i] >> m[i] >> t_str;
-        if (t_str == "device") { type[i] = TYPE_DEVICE; device_ids.push_back(i); } 
-        else { type[i] = TYPE_NORMAL; }
+        std::string t_str; fin >> qx[i] >> qy[i] >> qz[i] >> vx[i] >> vy[i] >> vz[i] >> m[i] >> t_str;
+        if (t_str == "device") { type[i] = TYPE_DEVICE; device_ids.push_back(i); } else type[i] = TYPE_NORMAL;
     }
 }
-
-void write_output(const char* filename, double min_dist, int hit_time_step,
-    int gravity_device_id, double missile_cost) {
+void write_output(const char* filename, double min_dist, int hit_time_step, int gravity_device_id, double missile_cost) {
     std::ofstream fout(filename);
-    fout << std::scientific << std::setprecision(std::numeric_limits<double>::digits10 + 1) 
-         << min_dist << '\n' << hit_time_step << '\n' << gravity_device_id << ' ' << missile_cost << '\n';
+    fout << std::scientific << std::setprecision(std::numeric_limits<double>::digits10 + 1) << min_dist << '\n' << hit_time_step << '\n' << gravity_device_id << ' ' << missile_cost << '\n';
 }
 
 int main(int argc, char** argv) {
     if (argc != 3) return 1;
     int n, planet, asteroid;
-    std::vector<double> qx, qy, qz, vx, vy, vz, m;
-    std::vector<int> type, device_ids;
+    std::vector<double> qx, qy, qz, vx, vy, vz, m; std::vector<int> type, device_ids;
     read_input(argv[1], n, planet, asteroid, qx, qy, qz, vx, vy, vz, m, type, device_ids);
-
     SimParams params = {n, 200000, 60.0, 1e-3, 6.674e-11, 1e7, 1e6, planet, asteroid};
 
     HIP_CHECK(hipSetDevice(0)); HIP_CHECK(hipDeviceEnablePeerAccess(1, 0));
     HIP_CHECK(hipSetDevice(1)); HIP_CHECK(hipDeviceEnablePeerAccess(0, 0));
 
-    Simulator sim0(0, params, m, type);
-    Simulator sim1(1, params, m, type);
-
+    Simulator sim0(0, params, m, type); Simulator sim1(1, params, m, type);
     std::pair<double, int> res_p2, res_p1;
-    std::vector<double> checkpoints;
-    std::vector<int> destroy_steps;
+    std::vector<double> checkpoints; std::vector<int> destroy_steps;
 
     std::thread t1([&]() { res_p1 = sim1.run_main(qx, qy, qz, vx, vy, vz, true); });
     std::thread t2([&]() { res_p2 = sim0.run_main(qx, qy, qz, vx, vy, vz, false, &checkpoints, &destroy_steps); });
     t1.join(); t2.join();
 
-    int best_id = -1;
-    double min_cost = std::numeric_limits<double>::infinity();
-
+    int best_id = -1; double min_cost = std::numeric_limits<double>::infinity();
     if (res_p2.second != -2 && !device_ids.empty()) {
         std::vector<int> tasks0, tasks1;
         for (int id : device_ids) {
             int step = destroy_steps[id];
             if (step != -1 && step <= params.n_steps) {
                 int ckpt = (step / CKPT_INTERVAL);
-                // Simple Round Robin
-                if (tasks0.size() <= tasks1.size()) {
-                    tasks0.push_back(id); tasks0.push_back(step); tasks0.push_back(ckpt);
-                } else {
-                    tasks1.push_back(id); tasks1.push_back(step); tasks1.push_back(ckpt);
-                }
+                if (tasks0.size() <= tasks1.size()) { tasks0.push_back(id); tasks0.push_back(step); tasks0.push_back(ckpt); }
+                else { tasks1.push_back(id); tasks1.push_back(step); tasks1.push_back(ckpt); }
             }
         }
-        
         std::vector<int> res0, res1;
         std::thread w0([&]() { sim0.run_batch_p3(checkpoints, tasks0, res0); });
         std::thread w1([&]() { sim1.run_batch_p3(checkpoints, tasks1, res1); });
         w0.join(); w1.join();
-
-        auto process_results = [&](const std::vector<int>& tasks, const std::vector<int>& res) {
-            int n_t = tasks.size() / 3;
-            for(int i=0; i<n_t; i++) {
-                int id = tasks[i*3+0];
-                int step = tasks[i*3+1];
-                if (res[i] == -2) { // No Hit
-                    double cost = 1e5 + (double)step * params.dt * 1e3;
-                    if (cost < min_cost) { min_cost = cost; best_id = id; }
+        auto process = [&](const std::vector<int>& tasks, const std::vector<int>& res) {
+            for(size_t i=0; i<res.size(); i++) {
+                if (res[i] == -2) {
+                    double cost = 1e5 + (double)tasks[i*3+1] * params.dt * 1e3;
+                    if (cost < min_cost) { min_cost = cost; best_id = tasks[i*3+0]; }
                 }
             }
         };
-        process_results(tasks0, res0);
-        process_results(tasks1, res1);
+        process(tasks0, res0); process(tasks1, res1);
     }
     if (best_id == -1) min_cost = 0;
     write_output(argv[2], res_p1.first, res_p2.second, best_id, min_cost);
