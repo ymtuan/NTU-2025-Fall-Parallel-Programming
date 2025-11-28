@@ -20,3 +20,8 @@ A new kernel, broadcast_kernel, is introduced to drastically reduce host-to-devi
 - Parallel Multi-GPU Workflow: Problem 1 (GPU 1) and Problem 2 (GPU 0) run simultaneously on separate threads. The final Problem 3 tasks are distributed across both GPUs.
 - Kernel Optimizations: Implemented Shared Memory Tiling to optimize the $O(N^2)$ memory bandwidth, stored parameters in Constant Memory, and used Double Buffering to pipeline updates without race conditions.
 - Pre-calculation: Missile hit times are calculated once during the main simulation, so Problem 3 only simulates valid destruction scenarios.
+
+##
+- Kernel-Level Time Loop: Instead of the host launching a kernel for every time step ($200,000$ launches), we launch a kernel that runs an entire interval (e.g., 1,000 steps) completely on the GPU. The intermediate states are kept in registers and shared memory, bypassing global memory entirely until the interval finishes.
+- Batched Parallel P3: Problem 3 tasks ("what-if" scenarios) are no longer managed by host threads. We launch a single Massive Grid where each CUDA block independently simulates one candidate device from its checkpoint to the end. This fully saturates the GPU.
+- Single-Block Synchronization: Leveraging the constraint $N \le 1024$, we use a single thread block per universe to synchronize data with __syncthreads(), avoiding costly global memory barriers.
