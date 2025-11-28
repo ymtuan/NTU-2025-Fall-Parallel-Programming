@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <thread>
 #include <atomic>
+#include <numeric>
 
 #define HIP_CHECK(err) \
     do { \
@@ -26,7 +27,7 @@ const double eps = 1e-3;
 const double G = 6.674e-11;
 const double planet_radius = 1e7;
 const double missile_speed = 1e6;
-const int checkpoint_interval = 10000; // Reduced checkpoint frequency
+const int checkpoint_interval = 10000;
 }
 
 const int TYPE_NORMAL = 0;
@@ -46,6 +47,22 @@ __device__ __forceinline__ void atomicMinDouble(double* addr, double value) {
 }
 
 // ---------------------------------------------------------
+// OPTIMIZATION: KERNEL FOR BROADCASTING INITIAL STATE
+// ---------------------------------------------------------
+// Copies the first N elements of d_arr (initial state) to the remaining (batch_size-1) * N elements.
+__global__ void broadcast_kernel(double* d_arr, int n_bodies, int batch_size) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= n_bodies) return;
+
+    double val = d_arr[tid];
+    
+    // Broadcast to all batch universes (starting from index 1)
+    for (int i = 1; i < batch_size; ++i) {
+        d_arr[i * n_bodies + tid] = val;
+    }
+}
+
+// ---------------------------------------------------------
 // CHECKPOINT STRUCTURE
 // ---------------------------------------------------------
 struct Checkpoint {
@@ -55,14 +72,14 @@ struct Checkpoint {
 };
 
 // ---------------------------------------------------------
-// BATCHED KERNELS (Problem 3)
+// BATCHED KERNELS (Problem 3) - UNCHANGED
 // ---------------------------------------------------------
 __global__ void update_mass_batched_kernel(
     const double* qx, const double* qy, const double* qz,
     const double* base_mass, const int* type, double* current_mass,
     int n, int step,
     const int* target_device_ids, 
-    int planet_id, // Pass ID instead of static coords to read CURRENT pos
+    int planet_id, 
     int* missile_hit_steps)       
 {
     int universe_idx = blockIdx.y;
@@ -79,7 +96,6 @@ __global__ void update_mass_batched_kernel(
         int target_id = target_device_ids[universe_idx];
 
         if (target_id == tid) {
-            // FIX: Read CURRENT Planet Position
             double px = qx[offset + planet_id];
             double py = qy[offset + planet_id];
             double pz = qz[offset + planet_id];
@@ -120,7 +136,6 @@ __global__ void compute_forces_batched_kernel(
     bool is_active = (i < n);
     int global_i = offset + i;
 
-    // Register caching for positions
     double my_qx = 0.0, my_qy = 0.0, my_qz = 0.0;
     double ax = 0.0, ay = 0.0, az = 0.0;
     double my_vx = 0.0, my_vy = 0.0, my_vz = 0.0;
@@ -139,7 +154,7 @@ __global__ void compute_forces_batched_kernel(
     __shared__ double s_qz[256];
     __shared__ double s_mass[256];
 
-    const double G_eps_sq = param::G; // Use constant
+    const double G_eps_sq = param::G;
     const double eps_sq = param::eps * param::eps;
 
     for (int tile = 0; tile < (n + 255) / 256; ++tile) {
@@ -208,13 +223,13 @@ __global__ void check_collision_batched_kernel(
 
     if (planet_hit_steps[universe_idx] == -2) {
         if (dist_sq < param::planet_radius * param::planet_radius) {
-             planet_hit_steps[universe_idx] = step;
+             atomicCAS(&planet_hit_steps[universe_idx], -2, step);
         }
     }
 }
 
 // ---------------------------------------------------------
-// SINGLE SIMULATION KERNELS (Prob 1 & 2)
+// SINGLE SIMULATION KERNELS (Prob 1 & 2) - UNCHANGED
 // ---------------------------------------------------------
 __global__ void update_mass_single_kernel(
     const double* qx, const double* qy, const double* qz,
@@ -324,7 +339,7 @@ __global__ void compute_forces_split_kernel(
 }
 
 // ---------------------------------------------------------
-// HOST FUNCTIONS
+// HOST FUNCTIONS - UNCHANGED
 // ---------------------------------------------------------
 void read_input(const char* filename, int& n, int& planet, int& asteroid,
     std::vector<double>& qx, std::vector<double>& qy, std::vector<double>& qz,
@@ -368,7 +383,7 @@ struct GpuData {
     int *d_hit_step;
 };
 
-// Optimized: Single GPU version for P1 and P2 (faster than 2-GPU split for this problem size)
+// Single GPU version for P1 and P2 
 std::pair<double, int> run_single_sim_fast(
     int n, int planet, int asteroid, int n_steps,
     const std::vector<double>& h_qx, const std::vector<double>& h_qy, const std::vector<double>& h_qz,
@@ -433,7 +448,7 @@ std::pair<double, int> run_single_sim_fast(
     return {h_min, h_step};
 }
 
-// Problem 3 Solver (Batched independent simulations)
+// Problem 3 Solver (Batched independent simulations) - OPTIMIZED
 void run_batch_sim(
     int device_id_gpu, 
     const std::vector<int>& batch_targets,
@@ -448,70 +463,73 @@ void run_batch_sim(
 
     HIP_CHECK(hipSetDevice(device_id_gpu));
 
-    size_t sz_d = n * batch_size * sizeof(double);
-    
+    size_t sz_d_batch = n * batch_size * sizeof(double);
+    size_t sz_d_single = n * sizeof(double);
+    size_t sz_i_single = n * sizeof(int);
+
     double *d_qx, *d_qy, *d_qz, *d_vx, *d_vy, *d_vz, *d_cur_mass, *d_base_mass;
     int *d_type, *d_targets, *d_missile_steps, *d_planet_steps;
 
-    HIP_CHECK(hipMalloc(&d_qx, sz_d));
-    HIP_CHECK(hipMalloc(&d_qy, sz_d));
-    HIP_CHECK(hipMalloc(&d_qz, sz_d));
-    HIP_CHECK(hipMalloc(&d_vx, sz_d));
-    HIP_CHECK(hipMalloc(&d_vy, sz_d));
-    HIP_CHECK(hipMalloc(&d_vz, sz_d));
-    HIP_CHECK(hipMalloc(&d_cur_mass, sz_d));
-    HIP_CHECK(hipMalloc(&d_base_mass, n * sizeof(double)));
-    HIP_CHECK(hipMalloc(&d_type, n * sizeof(int)));
-
+    // Allocate batch arrays
+    HIP_CHECK(hipMalloc(&d_qx, sz_d_batch));
+    HIP_CHECK(hipMalloc(&d_qy, sz_d_batch));
+    HIP_CHECK(hipMalloc(&d_qz, sz_d_batch));
+    HIP_CHECK(hipMalloc(&d_vx, sz_d_batch));
+    HIP_CHECK(hipMalloc(&d_vy, sz_d_batch));
+    HIP_CHECK(hipMalloc(&d_vz, sz_d_batch));
+    HIP_CHECK(hipMalloc(&d_cur_mass, sz_d_batch));
+    
+    // Allocate single arrays (shared by all batches)
+    HIP_CHECK(hipMalloc(&d_base_mass, sz_d_single));
+    HIP_CHECK(hipMalloc(&d_type, sz_i_single));
+    
+    // Allocate results/targets
     HIP_CHECK(hipMalloc(&d_targets, batch_size * sizeof(int)));
     HIP_CHECK(hipMalloc(&d_missile_steps, batch_size * sizeof(int)));
     HIP_CHECK(hipMalloc(&d_planet_steps, batch_size * sizeof(int)));
 
-    // Optimized: Use pinned memory and async copies
-    double *h_temp_q = new double[n * 3];
-    double *h_temp_v = new double[n * 3];
-    std::copy(h_qx.begin(), h_qx.end(), h_temp_q);
-    std::copy(h_qy.begin(), h_qy.end(), h_temp_q + n);
-    std::copy(h_qz.begin(), h_qz.end(), h_temp_q + 2*n);
-    std::copy(h_vx.begin(), h_vx.end(), h_temp_v);
-    std::copy(h_vy.begin(), h_vy.end(), h_temp_v + n);
-    std::copy(h_vz.begin(), h_vz.end(), h_temp_v + 2*n);
+    // 1. Copy initial state (1xN) for batch 0 only (one H2D copy per array)
+    HIP_CHECK(hipMemcpy(d_qx, h_qx.data(), sz_d_single, hipMemcpyHostToDevice));
+    HIP_CHECK(hipMemcpy(d_qy, h_qy.data(), sz_d_single, hipMemcpyHostToDevice));
+    HIP_CHECK(hipMemcpy(d_qz, h_qz.data(), sz_d_single, hipMemcpyHostToDevice));
+    HIP_CHECK(hipMemcpy(d_vx, h_vx.data(), sz_d_single, hipMemcpyHostToDevice));
+    HIP_CHECK(hipMemcpy(d_vy, h_vy.data(), sz_d_single, hipMemcpyHostToDevice));
+    HIP_CHECK(hipMemcpy(d_vz, h_vz.data(), sz_d_single, hipMemcpyHostToDevice));
 
-    // Broadcast initial state to all universes
-    for(int i=0; i<batch_size; ++i) {
-        int off = i * n;
-        HIP_CHECK(hipMemcpy(d_qx + off, h_temp_q, n*sizeof(double), hipMemcpyHostToDevice));
-        HIP_CHECK(hipMemcpy(d_qy + off, h_temp_q + n, n*sizeof(double), hipMemcpyHostToDevice));
-        HIP_CHECK(hipMemcpy(d_qz + off, h_temp_q + 2*n, n*sizeof(double), hipMemcpyHostToDevice));
-        HIP_CHECK(hipMemcpy(d_vx + off, h_temp_v, n*sizeof(double), hipMemcpyHostToDevice));
-        HIP_CHECK(hipMemcpy(d_vy + off, h_temp_v + n, n*sizeof(double), hipMemcpyHostToDevice));
-        HIP_CHECK(hipMemcpy(d_vz + off, h_temp_v + 2*n, n*sizeof(double), hipMemcpyHostToDevice));
-    }
-    delete[] h_temp_q;
-    delete[] h_temp_v;
+    // 2. Launch broadcast kernel to replicate initial state (device-side copy)
+    int threads = 256;
+    int blocks = (n + 255) / 256;
+    dim3 grid_single(blocks, 1);
+    broadcast_kernel<<<grid_single, threads>>>(d_qx, n, batch_size);
+    broadcast_kernel<<<grid_single, threads>>>(d_qy, n, batch_size);
+    broadcast_kernel<<<grid_single, threads>>>(d_qz, n, batch_size);
+    broadcast_kernel<<<grid_single, threads>>>(d_vx, n, batch_size);
+    broadcast_kernel<<<grid_single, threads>>>(d_vy, n, batch_size);
+    broadcast_kernel<<<grid_single, threads>>>(d_vz, n, batch_size);
+    HIP_CHECK(hipDeviceSynchronize()); // Must sync before the simulation starts
 
-    HIP_CHECK(hipMemcpy(d_base_mass, h_m.data(), n * sizeof(double), hipMemcpyHostToDevice));
-    HIP_CHECK(hipMemcpy(d_type, h_type.data(), n * sizeof(int), hipMemcpyHostToDevice));
+    // Copy single-instance shared data
+    HIP_CHECK(hipMemcpy(d_base_mass, h_m.data(), sz_d_single, hipMemcpyHostToDevice));
+    HIP_CHECK(hipMemcpy(d_type, h_type.data(), sz_i_single, hipMemcpyHostToDevice));
     HIP_CHECK(hipMemcpy(d_targets, batch_targets.data(), batch_size * sizeof(int), hipMemcpyHostToDevice));
 
-    int init_m = 2000000;
+    // Initialize result arrays on host and copy to device
+    int init_m = param::n_steps + 1; // Use a value outside the max step for "no hit"
     int init_p = -2;
     std::vector<int> host_init_m(batch_size, init_m);
     std::vector<int> host_init_p(batch_size, init_p);
     HIP_CHECK(hipMemcpy(d_missile_steps, host_init_m.data(), batch_size * sizeof(int), hipMemcpyHostToDevice));
     HIP_CHECK(hipMemcpy(d_planet_steps, host_init_p.data(), batch_size * sizeof(int), hipMemcpyHostToDevice));
 
-    int threads = 256;
-    int blocks = (n + 255) / 256;
-    dim3 grid(blocks, batch_size); 
+    // Kernel launch loop
+    dim3 grid_batch(blocks, batch_size); 
 
-    // Optimize: Launch all kernels without sync until end
     for(int s=1; s<=n_steps; ++s) {
-        update_mass_batched_kernel<<<grid, threads>>>(
+        update_mass_batched_kernel<<<grid_batch, threads>>>(
             d_qx, d_qy, d_qz, d_base_mass, d_type, d_cur_mass,
             n, s, d_targets, planet, d_missile_steps);
         
-        compute_forces_batched_kernel<<<grid, threads>>>(
+        compute_forces_batched_kernel<<<grid_batch, threads>>>(
             d_qx, d_qy, d_qz, d_vx, d_vy, d_vz, d_cur_mass, n);
 
         check_collision_batched_kernel<<<dim3(1, batch_size), 1>>>(
@@ -520,9 +538,11 @@ void run_batch_sim(
 
     HIP_CHECK(hipDeviceSynchronize());
     
+    // Copy results back to host
     HIP_CHECK(hipMemcpy(h_missile_steps, d_missile_steps, batch_size * sizeof(int), hipMemcpyDeviceToHost));
     HIP_CHECK(hipMemcpy(h_planet_steps, d_planet_steps, batch_size * sizeof(int), hipMemcpyDeviceToHost));
 
+    // Free device memory
     HIP_CHECK(hipFree(d_qx)); HIP_CHECK(hipFree(d_qy)); HIP_CHECK(hipFree(d_qz));
     HIP_CHECK(hipFree(d_vx)); HIP_CHECK(hipFree(d_vy)); HIP_CHECK(hipFree(d_vz));
     HIP_CHECK(hipFree(d_cur_mass)); HIP_CHECK(hipFree(d_base_mass)); HIP_CHECK(hipFree(d_type));
@@ -538,27 +558,40 @@ int main(int argc, char** argv) {
 
     read_input(argv[1], n, planet, asteroid, qx, qy, qz, vx, vy, vz, m, type, device_ids);
 
-    // Enable peer access
+    // Enable peer access (important for P3 inter-GPU communication, though not explicitly used for data transfer here)
     HIP_CHECK(hipSetDevice(0));
     HIP_CHECK(hipDeviceEnablePeerAccess(1, 0));
     HIP_CHECK(hipSetDevice(1));
     HIP_CHECK(hipDeviceEnablePeerAccess(0, 0));
 
-    // Problem 1: Run on GPU 0
+    // Prepare mass for P1 (no gravity devices)
     std::vector<double> m_zero = m;
     for(size_t i=0; i<n; ++i) if(type[i] == TYPE_DEVICE) m_zero[i] = 0.0;
     
-    auto res1 = run_single_sim_fast(n, planet, asteroid, param::n_steps, 
-                                     qx, qy, qz, vx, vy, vz, m_zero, type, 0);
+    std::pair<double, int> res1_out;
+    std::pair<double, int> res2_out;
+    
+    // OPTIMIZATION: Parallelize P1 and P2 across GPU 0 and GPU 1
+    std::thread t_p1([&]() {
+        res1_out = run_single_sim_fast(n, planet, asteroid, param::n_steps, 
+                                       qx, qy, qz, vx, vy, vz, m_zero, type, 0);
+    });
 
-    // Problem 2: Run on GPU 1 (while GPU 0 potentially starts P3)
-    auto res2 = run_single_sim_fast(n, planet, asteroid, param::n_steps, 
-                                     qx, qy, qz, vx, vy, vz, m, type, 1);
+    std::thread t_p2([&]() {
+        res2_out = run_single_sim_fast(n, planet, asteroid, param::n_steps, 
+                                       qx, qy, qz, vx, vy, vz, m, type, 1);
+    });
 
+    t_p1.join();
+    t_p2.join();
+
+    auto res1 = res1_out;
+    auto res2 = res2_out;
+    
     int best_device_id = -1;
-    double min_cost = std::numeric_limits<double>::infinity();
+    double min_cost = 0.0;
 
-    // Problem 3: Batch all simulations and use both GPUs
+    // Problem 3: Only run if collision happened in P2
     if (res2.second != -2 && !device_ids.empty()) {
         std::vector<int> batch0, batch1;
         for(size_t i=0; i<device_ids.size(); ++i) {
@@ -569,27 +602,33 @@ int main(int argc, char** argv) {
         std::vector<int> m_steps0(batch0.size()), p_steps0(batch0.size());
         std::vector<int> m_steps1(batch1.size()), p_steps1(batch1.size());
 
+        // P3 is already parallelized with threads and load-balanced
         std::thread t0([&]() {
             if (!batch0.empty())
                 run_batch_sim(0, batch0, n, planet, asteroid, param::n_steps, 
-                             qx, qy, qz, vx, vy, vz, m, type, m_steps0.data(), p_steps0.data());
+                              qx, qy, qz, vx, vy, vz, m, type, m_steps0.data(), p_steps0.data());
         });
         
         std::thread t1([&]() {
             if (!batch1.empty())
                 run_batch_sim(1, batch1, n, planet, asteroid, param::n_steps, 
-                             qx, qy, qz, vx, vy, vz, m, type, m_steps1.data(), p_steps1.data());
+                              qx, qy, qz, vx, vy, vz, m, type, m_steps1.data(), p_steps1.data());
         });
 
         t0.join();
         t1.join();
 
+        min_cost = std::numeric_limits<double>::infinity();
+
         auto check_results = [&](const std::vector<int>& targets, const std::vector<int>& m_steps, const std::vector<int>& p_steps) {
             for(size_t i=0; i<targets.size(); ++i) {
                 int p_hit = p_steps[i];
                 int m_hit = m_steps[i];
-                if (p_hit == -2 && m_hit != 2000000) {
-                    double cost = 1e5 + (m_hit + 1) * param::dt * 1e3;
+                
+                // If collision was prevented (p_hit == -2) AND the missile actually launched (m_hit <= n_steps)
+                if (p_hit == -2 && m_hit <= param::n_steps) { 
+                    // Missile cost uses (step+1) for the formula, so if m_hit is the step, use (m_hit)
+                    double cost = 1e5 + (m_hit) * param::dt * 1e3; 
                     if (cost < min_cost) {
                         min_cost = cost;
                         best_device_id = targets[i];
@@ -601,7 +640,7 @@ int main(int argc, char** argv) {
         check_results(batch0, m_steps0, p_steps0);
         check_results(batch1, m_steps1, p_steps1);
     }
-
+    
     if (best_device_id == -1) {
         min_cost = 0;
     }
