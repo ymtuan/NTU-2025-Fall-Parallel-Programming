@@ -35,8 +35,8 @@ const int TYPE_NORMAL = 0;
 const int TYPE_DEVICE = 1;
 const int CKPT_INTERVAL = 1000;
 #define MAX_N 1024 
-// Threshold to switch between Single-Block (Low Latency) and Multi-Block (High Throughput)
-#define HYBRID_THRESHOLD 512 
+// Threshold: Small N runs on 1 block (low latency), Large N runs on many blocks (high throughput)
+#define HYBRID_THRESHOLD 256 
 
 // ---------------------------------------------------------
 // DEVICE HELPERS
@@ -52,22 +52,28 @@ __device__ __forceinline__ void atomicMinDouble(double* addr, double value) {
 }
 
 // ---------------------------------------------------------
-// KERNEL 1: MULTI-BLOCK PARALLEL (Best for Large N)
+// KERNEL 1: FUSED PARALLEL (Best for N > 256)
+// Combines Mass Calc, Force, Update, and Checks into ONE kernel
 // ---------------------------------------------------------
-__global__ void step_kernel_parallel(
+__global__ void step_kernel_large_fused(
     const double* __restrict__ qx_in, const double* __restrict__ qy_in, const double* __restrict__ qz_in,
     const double* __restrict__ vx_in, const double* __restrict__ vy_in, const double* __restrict__ vz_in,
     double* __restrict__ qx_out, double* __restrict__ qy_out, double* __restrict__ qz_out,
     double* __restrict__ vx_out, double* __restrict__ vy_out, double* __restrict__ vz_out,
-    const double* __restrict__ mass, 
+    const double* __restrict__ mass_base, 
     const int* __restrict__ type,
+    const double* __restrict__ sin_table,
     int step,
-    bool is_p1
+    bool is_p1,
+    double* d_min_dist,
+    int* d_hit_step,
+    int* d_device_destroy_steps
 ) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     int n = d_params.n;
     if (i >= n) return;
 
+    // 1. Load Local State
     double my_qx = qx_in[i];
     double my_qy = qy_in[i];
     double my_qz = qz_in[i];
@@ -77,6 +83,7 @@ __global__ void step_kernel_parallel(
 
     double ax = 0.0, ay = 0.0, az = 0.0;
     
+    // Shared Memory Tile
     __shared__ double s_qx[256];
     __shared__ double s_qy[256];
     __shared__ double s_qz[256];
@@ -84,21 +91,22 @@ __global__ void step_kernel_parallel(
 
     double eps_sq = d_params.eps * d_params.eps;
     double G = d_params.G;
-    double dt = d_params.dt;
+    double sin_val = sin_table[step]; // Pre-fetched sin factor
 
+    // 2. Force Loop (Tiled)
     for (int tile = 0; tile < (n + 255) / 256; tile++) {
         int idx = tile * 256 + threadIdx.x;
+        
+        // Cooperative Load + Mass Calc (On-the-fly)
         if (idx < n) {
             s_qx[threadIdx.x] = qx_in[idx];
             s_qy[threadIdx.x] = qy_in[idx];
             s_qz[threadIdx.x] = qz_in[idx];
-            double m_val = mass[idx];
+            
+            double m_val = mass_base[idx];
             if (type[idx] == TYPE_DEVICE) {
                 if (is_p1) m_val = 0.0;
-                else {
-                    double t = (double)step * dt;
-                    m_val = m_val + 0.5 * m_val * fabs(sin(t / 6000.0));
-                }
+                else m_val = m_val + 0.5 * m_val * sin_val;
             }
             s_m[threadIdx.x] = m_val;
         } else {
@@ -106,30 +114,79 @@ __global__ void step_kernel_parallel(
         }
         __syncthreads();
 
+        // Force Compute
         #pragma unroll 8
         for (int j = 0; j < 256; j++) {
             int j_idx = tile * 256 + j;
             if (j_idx >= n) break;
+            
             double dx = s_qx[j] - my_qx;
             double dy = s_qy[j] - my_qy;
             double dz = s_qz[j] - my_qz;
             double dist_sq = dx*dx + dy*dy + dz*dz + eps_sq;
             double dist_inv3 = rsqrt(dist_sq * dist_sq * dist_sq);
             double f = G * s_m[j] * dist_inv3;
+            
             ax += f * dx; ay += f * dy; az += f * dz;
         }
         __syncthreads();
     }
 
+    // 3. Update State
+    double dt = d_params.dt;
     double new_vx = my_vx + ax * dt;
     double new_vy = my_vy + ay * dt;
     double new_vz = my_vz + az * dt;
+    double new_qx = my_qx + new_vx * dt;
+    double new_qy = my_qy + new_vy * dt;
+    double new_qz = my_qz + new_vz * dt;
+
+    // 4. Write Back
     vx_out[i] = new_vx; vy_out[i] = new_vy; vz_out[i] = new_vz;
-    qx_out[i] = my_qx + new_vx * dt; qy_out[i] = my_qy + new_vy * dt; qz_out[i] = my_qz + new_vz * dt;
+    qx_out[i] = new_qx; qy_out[i] = new_qy; qz_out[i] = new_qz;
+
+    // 5. Fused Checks (Eliminates extra kernels)
+    // Note: We check against *old* positions (qx_in) for consistency across threads
+    // or we check strictly local properties.
+    
+    // A. Planet-Asteroid Collision (Thread 0 only)
+    if (i == 0) {
+        int pid = d_params.planet_id;
+        int aid = d_params.asteroid_id;
+        // Read directly from global memory (only 2 reads total for the whole grid)
+        double pdx = qx_in[pid] - qx_in[aid];
+        double pdy = qy_in[pid] - qy_in[aid];
+        double pdz = qz_in[pid] - qz_in[aid];
+        double pdist = sqrt(pdx*pdx + pdy*pdy + pdz*pdz);
+        
+        atomicMinDouble(d_min_dist, pdist);
+        if (pdist < d_params.planet_radius) {
+            atomicCAS(d_hit_step, -2, step);
+        }
+    }
+
+    // B. Missile Check (Each Device Thread)
+    if (!is_p1 && d_device_destroy_steps && type[i] == TYPE_DEVICE) {
+        int old_step = d_device_destroy_steps[i];
+        if (old_step == -1) {
+            int pid = d_params.planet_id;
+            // Read planet pos from global (safe, read-only input)
+            double pdx = qx_in[i] - qx_in[pid];
+            double pdy = qy_in[i] - qy_in[pid];
+            double pdz = qz_in[i] - qz_in[pid];
+            double dist_sq = pdx*pdx + pdy*pdy + pdz*pdz;
+            
+            double m_dist = (double)step * dt * d_params.missile_speed;
+            if (m_dist * m_dist > dist_sq) {
+                d_device_destroy_steps[i] = step;
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------
-// KERNEL 2: SINGLE-BLOCK FUSED INTERVAL (Best for Small N)
+// KERNEL 2: FUSED INTERVAL (Best for N <= 256)
+// Runs entire time-loop in registers/shared mem
 // ---------------------------------------------------------
 __global__ void run_interval_kernel_single_block(
     const double* __restrict__ qx_in, const double* __restrict__ qy_in, const double* __restrict__ qz_in,
@@ -138,6 +195,7 @@ __global__ void run_interval_kernel_single_block(
     double* __restrict__ vx_out, double* __restrict__ vy_out, double* __restrict__ vz_out,
     const double* __restrict__ mass_base, 
     const int* __restrict__ type,
+    const double* __restrict__ sin_table,
     int start_step,
     int n_steps_to_run,
     bool is_p1,
@@ -174,15 +232,10 @@ __global__ void run_interval_kernel_single_block(
             double m_val = my_m_base;
             if (my_type == TYPE_DEVICE) {
                 if (is_p1) m_val = 0.0;
-                else {
-                    double t = (double)current_step * dt;
-                    m_val = m_val + 0.5 * m_val * fabs(sin(t / 6000.0));
-                }
+                else m_val = m_val + 0.5 * m_val * sin_table[current_step];
             }
             s_m[i] = m_val;
-        } else {
-            s_m[i] = 0.0; 
-        }
+        } else { s_m[i] = 0.0; }
         __syncthreads();
 
         if (i < n) {
@@ -200,13 +253,10 @@ __global__ void run_interval_kernel_single_block(
             my_vx += ax * dt; my_vy += ay * dt; my_vz += az * dt;
             my_qx += my_vx * dt; my_qy += my_vy * dt; my_qz += my_vz * dt;
 
-            // Collision Check (Inside Loop)
+            // Fused Collision Check
             if (i == 0) {
-                int pid = d_params.planet_id;
-                int aid = d_params.asteroid_id;
-                double dx = s_qx[pid] - s_qx[aid];
-                double dy = s_qy[pid] - s_qy[aid];
-                double dz = s_qz[pid] - s_qz[aid];
+                int pid = d_params.planet_id; int aid = d_params.asteroid_id;
+                double dx = s_qx[pid] - s_qx[aid]; double dy = s_qy[pid] - s_qy[aid]; double dz = s_qz[pid] - s_qz[aid];
                 double dist = sqrt(dx*dx + dy*dy + dz*dz);
                 atomicMinDouble(d_min_dist, dist);
                 if (dist < d_params.planet_radius) {
@@ -214,16 +264,12 @@ __global__ void run_interval_kernel_single_block(
                     if (old != -2) atomicMin(d_hit_step, current_step);
                 }
             }
-
-            // Missile Check
+            // Fused Missile Check
             if (!is_p1 && d_device_destroy_steps && my_type == TYPE_DEVICE) {
                  int pid = d_params.planet_id;
-                 double dx = s_qx[i] - s_qx[pid];
-                 double dy = s_qy[i] - s_qy[pid];
-                 double dz = s_qz[i] - s_qz[pid];
-                 double dist_sq = dx*dx + dy*dy + dz*dz;
+                 double dx = s_qx[i] - s_qx[pid]; double dy = s_qy[i] - s_qy[pid]; double dz = s_qz[i] - s_qz[pid];
                  double m_dist = (double)current_step * dt * d_params.missile_speed;
-                 if (m_dist * m_dist > dist_sq) {
+                 if (m_dist * m_dist > (dx*dx + dy*dy + dz*dz)) {
                      int old = d_device_destroy_steps[i];
                      if (old == -1) d_device_destroy_steps[i] = current_step;
                  }
@@ -238,39 +284,13 @@ __global__ void run_interval_kernel_single_block(
     }
 }
 
-// Helpers for Multi-Block mode
-__global__ void check_hit_kernel(const double* qx, const double* qy, const double* qz, int step, double* d_min_dist, int* d_hit_step) {
-    if (threadIdx.x != 0) return;
-    int pid = d_params.planet_id; int aid = d_params.asteroid_id;
-    double dx = qx[pid] - qx[aid]; double dy = qy[pid] - qy[aid]; double dz = qz[pid] - qz[aid];
-    double dist = sqrt(dx*dx + dy*dy + dz*dz);
-    if(d_min_dist) atomicMinDouble(d_min_dist, dist);
-    if (dist < d_params.planet_radius) atomicCAS(d_hit_step, -2, step);
-}
-
-__global__ void check_missile_kernel_parallel(const double* qx, const double* qy, const double* qz, const int* type, int step, int* d_dest) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= d_params.n) return;
-    if (type[i] == TYPE_DEVICE && d_dest[i] == -1) {
-        int pid = d_params.planet_id;
-        double dx = qx[i] - qx[pid]; double dy = qy[i] - qy[pid]; double dz = qz[i] - qz[pid];
-        double dist_sq = dx*dx + dy*dy + dz*dz;
-        double m_dist = (double)step * d_params.dt * d_params.missile_speed;
-        if (m_dist * m_dist > dist_sq) d_dest[i] = step;
-    }
-}
-
 // ---------------------------------------------------------
-// KERNEL 3: BATCHED P3 (Unchanged - Parallel is always best for batching)
+// P3 BATCH KERNEL (Unchanged)
 // ---------------------------------------------------------
 __global__ void run_p3_batch_kernel(
-    const double* __restrict__ ckpt_data, 
-    const int* __restrict__ tasks_info,   
-    int* __restrict__ results,           
-    const double* __restrict__ mass_base,
-    const int* __restrict__ type,
-    int n_tasks,
-    int n_bodies
+    const double* __restrict__ ckpt_data, const int* __restrict__ tasks_info, int* __restrict__ results,           
+    const double* __restrict__ mass_base, const int* __restrict__ type, const double* __restrict__ sin_table,
+    int n_tasks, int n_bodies
 ) {
     int task_idx = blockIdx.x;
     if (task_idx >= n_tasks) return;
@@ -293,18 +313,13 @@ __global__ void run_p3_batch_kernel(
     int current_step = ckpt_idx * CKPT_INTERVAL;
     int end_step = d_params.n_steps;
 
-    __shared__ double s_qx[MAX_N];
-    __shared__ double s_qy[MAX_N];
-    __shared__ double s_qz[MAX_N];
-    __shared__ double s_m[MAX_N];
-    __shared__ int s_hit;
+    __shared__ double s_qx[MAX_N]; __shared__ double s_qy[MAX_N]; __shared__ double s_qz[MAX_N];
+    __shared__ double s_m[MAX_N]; __shared__ int s_hit;
 
     if (i == 0) s_hit = -2;
     __syncthreads();
 
-    double eps_sq = d_params.eps * d_params.eps;
-    double G = d_params.G;
-    double dt = d_params.dt;
+    double eps_sq = d_params.eps * d_params.eps; double G = d_params.G; double dt = d_params.dt;
 
     for (int s = current_step; s <= end_step; s++) {
         if (i < n_bodies) {
@@ -312,10 +327,7 @@ __global__ void run_p3_batch_kernel(
             double m_val = my_m_base;
             if (my_type == TYPE_DEVICE) {
                 if (i == target_id && s >= destroy_step) m_val = 0.0;
-                else {
-                    double t = (double)s * dt;
-                    m_val = m_val + 0.5 * m_val * fabs(sin(t / 6000.0));
-                }
+                else m_val = m_val + 0.5 * m_val * sin_table[s];
             }
             s_m[i] = m_val;
         } else { s_m[i] = 0.0; }
@@ -324,12 +336,9 @@ __global__ void run_p3_batch_kernel(
         if (i == 0) {
             int pid = d_params.planet_id; int aid = d_params.asteroid_id;
             double dx = s_qx[pid] - s_qx[aid]; double dy = s_qy[pid] - s_qy[aid]; double dz = s_qz[pid] - s_qz[aid];
-            if ((dx*dx + dy*dy + dz*dz) < (d_params.planet_radius * d_params.planet_radius)) {
-                if (s_hit == -2) s_hit = s; 
-            }
+            if ((dx*dx + dy*dy + dz*dz) < (d_params.planet_radius * d_params.planet_radius)) { if (s_hit == -2) s_hit = s; }
         }
         __syncthreads();
-        
         if (s_hit != -2) break;
 
         if (i < n_bodies) {
@@ -356,12 +365,12 @@ __global__ void run_p3_batch_kernel(
 class Simulator {
     int device_id; int n; SimParams params;
     double *d_qx[2], *d_qy[2], *d_qz[2], *d_vx[2], *d_vy[2], *d_vz[2];
-    double *d_mass; int *d_type;
+    double *d_mass; int *d_type; double *d_sin_table;
     double *d_min_dist; int *d_hit_step; int *d_device_destroy_steps;
     double *d_flat_ckpts; int *d_tasks; int *d_results;
 
 public:
-    Simulator(int dev_id, const SimParams& p, const std::vector<double>& h_m, const std::vector<int>& h_t) 
+    Simulator(int dev_id, const SimParams& p, const std::vector<double>& h_m, const std::vector<int>& h_t, const std::vector<double>& h_sin) 
         : device_id(dev_id), n(p.n), params(p) {
         HIP_CHECK(hipSetDevice(device_id));
         HIP_CHECK(hipMemcpyToSymbol(d_params, &params, sizeof(SimParams)));
@@ -372,6 +381,8 @@ public:
         }
         HIP_CHECK(hipMalloc(&d_mass, sz_d)); HIP_CHECK(hipMemcpy(d_mass, h_m.data(), sz_d, hipMemcpyHostToDevice));
         HIP_CHECK(hipMalloc(&d_type, n * sizeof(int))); HIP_CHECK(hipMemcpy(d_type, h_t.data(), n * sizeof(int), hipMemcpyHostToDevice));
+        HIP_CHECK(hipMalloc(&d_sin_table, (params.n_steps + 1) * sizeof(double)));
+        HIP_CHECK(hipMemcpy(d_sin_table, h_sin.data(), (params.n_steps + 1) * sizeof(double), hipMemcpyHostToDevice));
         HIP_CHECK(hipMalloc(&d_min_dist, sizeof(double))); HIP_CHECK(hipMalloc(&d_hit_step, sizeof(int)));
         HIP_CHECK(hipMalloc(&d_device_destroy_steps, n * sizeof(int)));
     }
@@ -415,14 +426,14 @@ public:
         }
 
         // HYBRID DISPATCH
-        if (n < HYBRID_THRESHOLD) {
-            // Use Fused Interval Kernel (Low Latency)
+        if (n <= HYBRID_THRESHOLD) {
+            // SINGLE BLOCK FUSED INTERVAL (Fast for small N)
             for (int s = 0; s < params.n_steps; s += CKPT_INTERVAL) {
                 int steps = std::min(CKPT_INTERVAL, params.n_steps - s);
                 run_interval_kernel_single_block<<<1, 1024>>>(
                     d_qx[in], d_qy[in], d_qz[in], d_vx[in], d_vy[in], d_vz[in],
                     d_qx[out], d_qy[out], d_qz[out], d_vx[out], d_vy[out], d_vz[out],
-                    d_mass, d_type, s + 1, steps, is_p1, d_min_dist, d_hit_step, d_device_destroy_steps);
+                    d_mass, d_type, d_sin_table, s + 1, steps, is_p1, d_min_dist, d_hit_step, d_device_destroy_steps);
                 
                 if (flat_checkpoints) {
                     HIP_CHECK(hipDeviceSynchronize());
@@ -438,17 +449,14 @@ public:
                 std::swap(in, out);
             }
         } else {
-            // Use Multi-Block Kernel (High Throughput)
+            // MULTI BLOCK FUSED (High Throughput for Large N)
             int blocks = (n + 255) / 256;
             for (int s = 1; s <= params.n_steps; s++) {
-                step_kernel_parallel<<<blocks, 256>>>(
+                step_kernel_large_fused<<<blocks, 256>>>(
                     d_qx[in], d_qy[in], d_qz[in], d_vx[in], d_vy[in], d_vz[in],
                     d_qx[out], d_qy[out], d_qz[out], d_vx[out], d_vy[out], d_vz[out],
-                    d_mass, d_type, s, is_p1);
+                    d_mass, d_type, d_sin_table, s, is_p1, d_min_dist, d_hit_step, d_device_destroy_steps);
                 
-                check_hit_kernel<<<1, 1>>>(d_qx[out], d_qy[out], d_qz[out], s, d_min_dist, d_hit_step);
-                if (!is_p1 && device_destroy_steps_out) check_missile_kernel_parallel<<<blocks, 256>>>(d_qx[out], d_qy[out], d_qz[out], d_type, s, d_device_destroy_steps);
-
                 if (flat_checkpoints && (s % CKPT_INTERVAL == 0)) {
                     HIP_CHECK(hipDeviceSynchronize());
                     int ckpt_idx = s / CKPT_INTERVAL;
@@ -484,7 +492,7 @@ public:
         size_t sz_tasks = tasks_info.size() * sizeof(int);
         HIP_CHECK(hipMalloc(&d_tasks, sz_tasks)); HIP_CHECK(hipMemcpy(d_tasks, tasks_info.data(), sz_tasks, hipMemcpyHostToDevice));
         HIP_CHECK(hipMalloc(&d_results, n_tasks * sizeof(int)));
-        run_p3_batch_kernel<<<n_tasks, 1024>>>(d_flat_ckpts, d_tasks, d_results, d_mass, d_type, n_tasks, n);
+        run_p3_batch_kernel<<<n_tasks, 1024>>>(d_flat_ckpts, d_tasks, d_results, d_mass, d_type, d_sin_table, n_tasks, n);
         HIP_CHECK(hipDeviceSynchronize());
         HIP_CHECK(hipMemcpy(results_out.data(), d_results, n_tasks * sizeof(int), hipMemcpyDeviceToHost));
         HIP_CHECK(hipFree(d_flat_ckpts)); HIP_CHECK(hipFree(d_tasks)); HIP_CHECK(hipFree(d_results));
@@ -512,10 +520,17 @@ int main(int argc, char** argv) {
     read_input(argv[1], n, planet, asteroid, qx, qy, qz, vx, vy, vz, m, type, device_ids);
     SimParams params = {n, 200000, 60.0, 1e-3, 6.674e-11, 1e7, 1e6, planet, asteroid};
 
+    // Pre-calculate Sin Table
+    std::vector<double> sin_table(params.n_steps + 1);
+    for(int s=0; s<=params.n_steps; ++s) {
+        double t = (double)s * params.dt;
+        sin_table[s] = fabs(sin(t / 6000.0));
+    }
+
     HIP_CHECK(hipSetDevice(0)); HIP_CHECK(hipDeviceEnablePeerAccess(1, 0));
     HIP_CHECK(hipSetDevice(1)); HIP_CHECK(hipDeviceEnablePeerAccess(0, 0));
 
-    Simulator sim0(0, params, m, type); Simulator sim1(1, params, m, type);
+    Simulator sim0(0, params, m, type, sin_table); Simulator sim1(1, params, m, type, sin_table);
     std::pair<double, int> res_p2, res_p1;
     std::vector<double> checkpoints; std::vector<int> destroy_steps;
 

@@ -1,0 +1,20 @@
+Looking for hw5.cpp: [32mOK[0m
+Looking for Makefile: [32mOK[0m
+Running: /usr/bin/make -C /home/pps038/.judge.2130947416 hw5
+make: Entering directory '/home/pps038/.judge.2130947416'
+hipcc -std=c++17 -O3 --offload-arch=gfx908 -o hw5 hw5.cpp
+make: Leaving directory '/home/pps038/.judge.2130947416'
+  b20    2.03   [32maccepted[0m
+  b30    2.38   [32maccepted[0m
+  b40    3.23   [32maccepted[0m
+  b50    4.03   [32maccepted[0m
+  b60    4.49   [32maccepted[0m
+  b70    4.03   [32maccepted[0m
+  b80    4.63   [32maccepted[0m
+  b90    4.49   [32maccepted[0m
+ b100    5.44   [32maccepted[0m
+ b200   14.40   [32maccepted[0m
+ b512   39.24   [32maccepted[0m
+b1024   86.67   [32maccepted[0m
+Removing temporary directory /home/pps038/.judge.2130947416
+Scoreboard: not updating {12 173.86} -x-> {12 175.07}
