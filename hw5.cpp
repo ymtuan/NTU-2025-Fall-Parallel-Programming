@@ -55,6 +55,13 @@ __device__ __forceinline__ void atomicMinDouble(double* addr, double value) {
 // KERNEL 1: FUSED PARALLEL (Best for N > 256)
 // Combines Mass Calc, Force, Update, and Checks into ONE kernel
 // ---------------------------------------------------------
+// ---------------------------------------------------------
+// OPTIMIZED KERNEL: FUSED PARALLEL
+// Improvements:
+// 1. Padding (Ghost Particles) eliminates 'if' checks in inner loop
+// 2. Shared Memory caching for Planet Position (for collision checks)
+// 3. Instruction pipelining via fixed loop bounds
+// ---------------------------------------------------------
 __global__ void step_kernel_large_fused(
     const double* __restrict__ qx_in, const double* __restrict__ qy_in, const double* __restrict__ qz_in,
     const double* __restrict__ vx_in, const double* __restrict__ vy_in, const double* __restrict__ vz_in,
@@ -69,17 +76,36 @@ __global__ void step_kernel_large_fused(
     int* d_hit_step,
     int* d_device_destroy_steps
 ) {
+    // 1. Initialization
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     int n = d_params.n;
-    if (i >= n) return;
 
-    // 1. Load Local State
-    double my_qx = qx_in[i];
-    double my_qy = qy_in[i];
-    double my_qz = qz_in[i];
-    double my_vx = vx_in[i];
-    double my_vy = vy_in[i];
-    double my_vz = vz_in[i];
+    // Load Planet Position into Shared Memory ONCE for the whole block
+    // This optimization saves Global Memory bandwidth during the collision check phase later
+    __shared__ double s_planet_pos[3];
+    if (threadIdx.x == 0) {
+        int pid = d_params.planet_id;
+        s_planet_pos[0] = qx_in[pid];
+        s_planet_pos[1] = qy_in[pid];
+        s_planet_pos[2] = qz_in[pid];
+    }
+
+    // Early exit only after shared mem load is scheduled, 
+    // but usually safer to just mask operations. 
+    // For N-body, we usually let threads run to facilitate tiling.
+    
+    // Load local body state
+    double my_qx, my_qy, my_qz, my_vx, my_vy, my_vz;
+    
+    // We mask load to prevent out-of-bounds read, but we initialize to 0 
+    // to prevent NaNs in calculation (though they won't be written back)
+    if (i < n) {
+        my_qx = qx_in[i]; my_qy = qy_in[i]; my_qz = qz_in[i];
+        my_vx = vx_in[i]; my_vy = vy_in[i]; my_vz = vz_in[i];
+    } else {
+        my_qx = 0.0; my_qy = 0.0; my_qz = 0.0;
+        // Velocities don't matter for out-of-bound threads
+    }
 
     double ax = 0.0, ay = 0.0, az = 0.0;
     
@@ -91,46 +117,67 @@ __global__ void step_kernel_large_fused(
 
     double eps_sq = d_params.eps * d_params.eps;
     double G = d_params.G;
-    double sin_val = sin_table[step]; // Pre-fetched sin factor
+    double sin_val = sin_table[step]; 
+    int tile_count = (n + 255) / 256;
 
     // 2. Force Loop (Tiled)
-    for (int tile = 0; tile < (n + 255) / 256; tile++) {
+    for (int tile = 0; tile < tile_count; tile++) {
         int idx = tile * 256 + threadIdx.x;
         
-        // Cooperative Load + Mass Calc (On-the-fly)
+        // --- Cooperative Load ---
+        // We load positions/mass. If idx >= n, we load "Ghost Particles"
+        // Ghost particles have mass 0.0, so they contribute 0 force.
+        // This allows us to remove bounds checks in the math loop.
+        double load_qx = 0.0, load_qy = 0.0, load_qz = 0.0, load_m = 0.0;
+        
         if (idx < n) {
-            s_qx[threadIdx.x] = qx_in[idx];
-            s_qy[threadIdx.x] = qy_in[idx];
-            s_qz[threadIdx.x] = qz_in[idx];
+            load_qx = qx_in[idx];
+            load_qy = qy_in[idx];
+            load_qz = qz_in[idx];
             
             double m_val = mass_base[idx];
+            // Resolve mass logic during load to avoid divergence in math loop
             if (type[idx] == TYPE_DEVICE) {
                 if (is_p1) m_val = 0.0;
                 else m_val = m_val + 0.5 * m_val * sin_val;
             }
-            s_m[threadIdx.x] = m_val;
-        } else {
-            s_m[threadIdx.x] = 0.0;
+            load_m = m_val;
         }
+        
+        s_qx[threadIdx.x] = load_qx;
+        s_qy[threadIdx.x] = load_qy;
+        s_qz[threadIdx.x] = load_qz;
+        s_m[threadIdx.x]  = load_m;
+        
         __syncthreads();
 
-        // Force Compute
-        #pragma unroll 8
+        // --- Compute Loop ---
+        // OPTIMIZATION: Fixed loop count (256). No "if (j_idx >= n) break".
+        // This allows the compiler to unroll and pipeline loads/FMAs effectively.
+        #pragma unroll 16
         for (int j = 0; j < 256; j++) {
-            int j_idx = tile * 256 + j;
-            if (j_idx >= n) break;
-            
             double dx = s_qx[j] - my_qx;
             double dy = s_qy[j] - my_qy;
             double dz = s_qz[j] - my_qz;
+            
+            // Self-interaction (dx=0) results in dist_sq = eps_sq.
+            // Force calculation f = G * m * r^-3.
+            // If i == j, dx is 0, so ax += f * 0.0 adds nothing. Safe.
+            
             double dist_sq = dx*dx + dy*dy + dz*dz + eps_sq;
-            double dist_inv3 = rsqrt(dist_sq * dist_sq * dist_sq);
+            double dist_inv = rsqrt(dist_sq); 
+            double dist_inv3 = dist_inv * dist_inv * dist_inv;
             double f = G * s_m[j] * dist_inv3;
             
-            ax += f * dx; ay += f * dy; az += f * dz;
+            ax += f * dx; 
+            ay += f * dy; 
+            az += f * dz;
         }
         __syncthreads();
     }
+
+    // If out of bounds, exit now (we only needed to stay for the tile loading)
+    if (i >= n) return;
 
     // 3. Update State
     double dt = d_params.dt;
@@ -145,19 +192,21 @@ __global__ void step_kernel_large_fused(
     vx_out[i] = new_vx; vy_out[i] = new_vy; vz_out[i] = new_vz;
     qx_out[i] = new_qx; qy_out[i] = new_qy; qz_out[i] = new_qz;
 
-    // 5. Fused Checks (Eliminates extra kernels)
-    // Note: We check against *old* positions (qx_in) for consistency across threads
-    // or we check strictly local properties.
+    // 5. Fused Checks
     
     // A. Planet-Asteroid Collision (Thread 0 only)
+    // Using s_planet_pos is slightly faster than global read if tile cache is hot,
+    // though for thread 0 it doesn't matter much. 
     if (i == 0) {
-        int pid = d_params.planet_id;
         int aid = d_params.asteroid_id;
-        // Read directly from global memory (only 2 reads total for the whole grid)
-        double pdx = qx_in[pid] - qx_in[aid];
-        double pdy = qy_in[pid] - qy_in[aid];
-        double pdz = qz_in[pid] - qz_in[aid];
-        double pdist = sqrt(pdx*pdx + pdy*pdy + pdz*pdz);
+        // We can read asteroid from our own register if i == aid, 
+        // but typically i=0 is the planet or a star. 
+        // Safe to read asteroid from Global or calculate if we are the asteroid.
+        // Let's stick to global read for safety on the Asteroid index.
+        double adx = s_planet_pos[0] - qx_in[aid];
+        double ady = s_planet_pos[1] - qy_in[aid];
+        double adz = s_planet_pos[2] - qz_in[aid];
+        double pdist = sqrt(adx*adx + ady*ady + adz*adz);
         
         atomicMinDouble(d_min_dist, pdist);
         if (pdist < d_params.planet_radius) {
@@ -165,15 +214,15 @@ __global__ void step_kernel_large_fused(
         }
     }
 
-    // B. Missile Check (Each Device Thread)
+    // B. Missile Check (Many threads)
+    // OPTIMIZATION: Use Shared Memory Planet Pos
     if (!is_p1 && d_device_destroy_steps && type[i] == TYPE_DEVICE) {
         int old_step = d_device_destroy_steps[i];
         if (old_step == -1) {
-            int pid = d_params.planet_id;
-            // Read planet pos from global (safe, read-only input)
-            double pdx = qx_in[i] - qx_in[pid];
-            double pdy = qy_in[i] - qy_in[pid];
-            double pdz = qz_in[i] - qz_in[pid];
+            // Read planet pos from SHARED memory (Broadcast)
+            double pdx = qx_in[i] - s_planet_pos[0];
+            double pdy = qy_in[i] - s_planet_pos[1];
+            double pdz = qz_in[i] - s_planet_pos[2];
             double dist_sq = pdx*pdx + pdy*pdy + pdz*pdz;
             
             double m_dist = (double)step * dt * d_params.missile_speed;

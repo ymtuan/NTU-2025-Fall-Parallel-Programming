@@ -21,33 +21,48 @@ A new kernel, broadcast_kernel, is introduced to drastically reduce host-to-devi
 - Kernel Optimizations: Implemented Shared Memory Tiling to optimize the $O(N^2)$ memory bandwidth, stored parameters in Constant Memory, and used Double Buffering to pipeline updates without race conditions.
 - Pre-calculation: Missile hit times are calculated once during the main simulation, so Problem 3 only simulates valid destruction scenarios.
 
-  b40    5.84   accepted
-  b20    5.19   accepted
-  b30    4.78   accepted
-  b70    6.59   accepted
-  b50    6.99   accepted
-  b60    7.04   accepted
-  b80    7.64   accepted
- b100    8.04   accepted
-  b90   11.15   accepted
- b200   24.82   accepted
- b512   34.74   accepted
+  b40    5.84   accepted  
+  b20    5.19   accepted  
+  b30    4.78   accepted  
+  b70    6.59   accepted  
+  b50    6.99   accepted  
+  b60    7.04   accepted  
+  b80    7.64   accepted  
+ b100    8.04   accepted  
+  b90   11.15   accepted  
+ b200   24.82   accepted  
+ b512   34.74   accepted  
 b1024   60.33   accepted
 
-##
-- Kernel-Level Time Loop: Instead of the host launching a kernel for every time step ($200,000$ launches), we launch a kernel that runs an entire interval (e.g., 1,000 steps) completely on the GPU. The intermediate states are kept in registers and shared memory, bypassing global memory entirely until the interval finishes.
-- Batched Parallel P3: Problem 3 tasks ("what-if" scenarios) are no longer managed by host threads. We launch a single Massive Grid where each CUDA block independently simulates one candidate device from its checkpoint to the end. This fully saturates the GPU.
-- Single-Block Synchronization: Leveraging the constraint $N \le 1024$, we use a single thread block per universe to synchronize data with __syncthreads(), avoiding costly global memory barriers.
+## 164.01
+- Elimination of Control Flow (Branchless Loop)
 
-  b20    2.03   accepted
-  b40    3.18   accepted
-  b30    2.38   accepted
-  b60    4.44   accepted
-  b50    3.98   accepted
-  b70    4.03   accepted
-  b80    4.59   accepted
-  b90    4.48   accepted
- b100    5.49   accepted
- b200   14.35   accepted
- b512   38.84   accepted
-b1024   86.07   accepted
+  - What we did: We removed the if (idx >= n) break; check inside the innermost calculation loop.
+
+  - How: We "padded" the Shared Memory tiles with Ghost Particles (particles with mass = 0) for any index outside the valid range.
+
+  - Why it helps: The GPU hates conditional jumps inside tight loops. By ensuring every thread runs exactly 256 iterations, the compiler can fully pipeline instructions and utilize Loop Unrolling, leading to much higher arithmetic throughput (FLOPs).
+
+- Shared Memory Caching for Collision Checks
+
+  - What we did: We loaded the Planet's position into __shared__ memory at the very start of the kernel (using just Thread 0).
+
+  - Why it helps: During the "Missile Check" phase, every single thread needs to calculate the distance to the planet. Previously, this caused massive contention on Global Memory. Now, all threads read from the fast L1/Shared cache.
+
+- Instruction Level Parallelism (ILP)
+
+  - What we did: By combining the fixed loop count with #pragma unroll, we allowed the GPU to issue multiple Multiply-Add (FMA) instructions simultaneously, hiding the latency of memory fetches.
+
+
+  b40    3.13   accepted  
+  b20    2.03   accepted  
+  b30    2.33   accepted  
+  b70    4.03   accepted  
+  b50    3.98   accepted  
+  b60    4.43   accepted  
+  b90    4.49   accepted  
+  b80    4.58   accepted  
+ b100    5.44   accepted  
+ b512   35.13   accepted  
+ b200   14.55   accepted  
+b1024   79.90   accepted
