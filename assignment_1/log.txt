@@ -1,0 +1,61 @@
+aggresive_fail19.cpp
+19 no sol.
+22 55.3
+23 68.5
+24 2.99
+25 doom
+
+// return walls[idx] || s.boxes[idx];
+return walls[idx];
+19 pass
+22 62.3
+23 180.2
+24 58.43
+25 killed
+
+new gemini
+22 61.9
+23 212.5
+24 62.62
+25
+
+gemini balance
+22 70.8
+23 157.5
+24 50.5
+25
+
+some full updated (hw1.cpp)
+22 58.9
+23 157.5
+24 50.5
+25
+
+
+// is_deadlock now includes the simple checks + a frozen box checkbool is_deadlock(const State &s) {
+    if(is_deadlock_simple(s)) return true;
+    int N = rows*cols;
+    
+    for(int i=0;i<N;++i){
+        if(!s.boxes[i]) continue;
+        if(targets[i]) continue; // Boxes on target are fine
+        
+        // --- ADDED: Static Dead Zones (precomputed) ---
+        if(dead_zone[i]) return true;
+        
+        // --- ADDED: Frozen Box (run-time check) ---
+        // Check if the box is blocked in both vertical and both horizontal directions
+        auto [r,c] = id_to_rc[i];
+        auto is_blocked = [&](int rr, int cc) -> bool {
+            if (rr < 0 || rr >= rows || cc < 0 || cc >= cols) return true;
+            int idx = rr * cols + cc;
+            return walls[idx] || s.boxes[idx];
+        };
+        
+        bool blocked_v = is_blocked(r-1, c) && is_blocked(r+1, c);
+        bool blocked_h = is_blocked(r, c-1) && is_blocked(r, c+1);
+        
+        if (blocked_v && blocked_h) return true;
+    }
+    return false;
+}
