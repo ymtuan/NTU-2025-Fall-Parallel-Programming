@@ -1,0 +1,12 @@
+# ignore
+
+hw2
+
+.tmp/
+
+*.o
+
+testcases/*.jpg
+goldens/*.jpg
+goldens/*.txt
+results/

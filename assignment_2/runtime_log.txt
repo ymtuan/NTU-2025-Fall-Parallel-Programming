@@ -1,0 +1,14 @@
+SIFT Execution & Validation Log - Fri Oct 17 23:24:59 CST 2025
+Running with: 2 Nodes, 4 Processes, 6 Cores per Process
+==================================================
+--- Test Case 05 ---
+Command: srun -A ACD114118 -N 2 -n 4 -c 6 --time=00:00:45 ./hw2 testcases/05.jpg results/05.jpg results/05.txt
+srun: No partition specified, setting to default partition 'ctest'
+srun:  User b12901069 Account ACD114118 wallet has 102499.2847 remaining.
+srun: job 17016065 queued and waiting for resources
+srun: job 17016065 has been allocated resources
+Execution time: 20369.5 ms
+Found 36876 keypoints.
+
+Validation Result: Pass
+
