@@ -51,9 +51,9 @@ __device__ __forceinline__ void atomicMinDouble(double* addr, double value) {
     } while (assumed != old);
 }
 
-// Multi-block kernel for large N (N > 256)
-// Uses shared memory tiling and register caching
-__global__ void __launch_bounds__(BLOCK_SIZE) step_kernel_large_fused(
+// 1-block-per-body kernel for large N (N > 256)
+// Each block computes acceleration for ONE body by having all threads cooperatively sum forces
+__global__ void __launch_bounds__(BLOCK_SIZE) step_kernel_one_block_per_body(
     const double* __restrict__ qx_in, const double* __restrict__ qy_in, const double* __restrict__ qz_in,
     const double* __restrict__ vx_in, const double* __restrict__ vy_in, const double* __restrict__ vz_in,
     double* __restrict__ qx_out, double* __restrict__ qy_out, double* __restrict__ qz_out,
@@ -67,36 +67,34 @@ __global__ void __launch_bounds__(BLOCK_SIZE) step_kernel_large_fused(
     int* d_hit_step,
     int* d_device_destroy_steps
 ) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int body_id = blockIdx.x;
+    int tid = threadIdx.x;
     int n = d_params.n;
+    
+    if (body_id >= n) return;
 
-    // Cache planet position in shared memory
+    // Shared memory for planet position and reduction
     __shared__ double s_planet_pos[3];
-    if (threadIdx.x == 0) {
+    __shared__ double s_ax[BLOCK_SIZE];
+    __shared__ double s_ay[BLOCK_SIZE];
+    __shared__ double s_az[BLOCK_SIZE];
+    
+    if (tid == 0) {
         int pid = d_params.planet_id;
         s_planet_pos[0] = qx_in[pid];
         s_planet_pos[1] = qy_in[pid];
         s_planet_pos[2] = qz_in[pid];
     }
+    __syncthreads();
 
-    // Load particle state into registers
-    double my_qx = 0.0, my_qy = 0.0, my_qz = 0.0;
-    double my_vx = 0.0, my_vy = 0.0, my_vz = 0.0;
-    int my_type = TYPE_NORMAL;
-    
-    if (i < n) {
-        my_qx = qx_in[i]; my_qy = qy_in[i]; my_qz = qz_in[i];
-        my_vx = vx_in[i]; my_vy = vy_in[i]; my_vz = vz_in[i];
-        my_type = type[i];
-    }
-
-    double ax = 0.0, ay = 0.0, az = 0.0;
-    
-    // Shared memory tiles for position and mass
-    __shared__ double s_qx[BLOCK_SIZE];
-    __shared__ double s_qy[BLOCK_SIZE];
-    __shared__ double s_qz[BLOCK_SIZE];
-    __shared__ double s_m[BLOCK_SIZE];
+    // Load this body's position
+    double my_qx = qx_in[body_id];
+    double my_qy = qy_in[body_id];
+    double my_qz = qz_in[body_id];
+    double my_vx = vx_in[body_id];
+    double my_vy = vy_in[body_id];
+    double my_vz = vz_in[body_id];
+    int my_type = type[body_id];
 
     double eps_sq = d_params.eps * d_params.eps;
     double G = d_params.G;
@@ -106,98 +104,90 @@ __global__ void __launch_bounds__(BLOCK_SIZE) step_kernel_large_fused(
     #else
     double sin_val = sin_table[step];
     #endif
-    
-    int tile_count = (n + BLOCK_SIZE - 1) / BLOCK_SIZE;
 
-    // Force calculation with tiling
-    for (int tile = 0; tile < tile_count; tile++) {
-        int idx = tile * BLOCK_SIZE + threadIdx.x;
+    // Each thread accumulates forces from a subset of other bodies
+    double ax = 0.0, ay = 0.0, az = 0.0;
+    
+    for (int j = tid; j < n; j += BLOCK_SIZE) {
+        double other_qx = qx_in[j];
+        double other_qy = qy_in[j];
+        double other_qz = qz_in[j];
+        double other_m = mass_base[j];
+        int other_type = type[j];
         
-        // Load tile data with coalesced access
-        if (idx < n) {
-            double qx_tmp = qx_in[idx];
-            double qy_tmp = qy_in[idx];
-            double qz_tmp = qz_in[idx];
-            double m_tmp = mass_base[idx];
-            int type_tmp = type[idx];
-            
-            s_qx[threadIdx.x] = qx_tmp;
-            s_qy[threadIdx.x] = qy_tmp;
-            s_qz[threadIdx.x] = qz_tmp;
-            
-            // Apply device mass modulation
-            if (type_tmp == TYPE_DEVICE) {
-                m_tmp = is_p1 ? 0.0 : (m_tmp * (1.0 + 0.5 * sin_val));
-            }
-            s_m[threadIdx.x] = m_tmp * G;
-        } else {
-            // Ghost particles for padding
-            s_qx[threadIdx.x] = 0.0; 
-            s_qy[threadIdx.x] = 0.0; 
-            s_qz[threadIdx.x] = 0.0;
-            s_m[threadIdx.x]  = 0.0;
+        // Apply device mass modulation
+        if (other_type == TYPE_DEVICE) {
+            other_m = is_p1 ? 0.0 : (other_m * (1.0 + 0.5 * sin_val));
         }
-        __syncthreads();
-
-        // Accumulate forces from tile
-        if (i < n) {
-            #pragma unroll 8
-            for (int j = 0; j < BLOCK_SIZE; j++) {
-                double dx = s_qx[j] - my_qx;
-                double dy = s_qy[j] - my_qy;
-                double dz = s_qz[j] - my_qz;
-                
-                double dist_sq = dx*dx + dy*dy + dz*dz + eps_sq;
-                double dist_inv = rsqrt(dist_sq);
-                double dist_inv3 = dist_inv * dist_inv * dist_inv;
-                
-                double f = s_m[j] * dist_inv3;
-                
-                ax += f * dx; 
-                ay += f * dy; 
-                az += f * dz;
-            }
-        }
-        __syncthreads();
+        
+        double dx = other_qx - my_qx;
+        double dy = other_qy - my_qy;
+        double dz = other_qz - my_qz;
+        
+        double dist_sq = dx*dx + dy*dy + dz*dz + eps_sq;
+        double dist_inv = rsqrt(dist_sq);
+        double dist_inv3 = dist_inv * dist_inv * dist_inv;
+        
+        double f = G * other_m * dist_inv3;
+        
+        ax += f * dx;
+        ay += f * dy;
+        az += f * dz;
     }
-
-    if (i >= n) return;
-
-    // Update velocity and position
-    double dt = d_params.dt;
-    double new_vx = my_vx + ax * dt;
-    double new_vy = my_vy + ay * dt;
-    double new_vz = my_vz + az * dt;
     
-    vx_out[i] = new_vx; vy_out[i] = new_vy; vz_out[i] = new_vz;
-    qx_out[i] = my_qx + new_vx * dt; 
-    qy_out[i] = my_qy + new_vy * dt; 
-    qz_out[i] = my_qz + new_vz * dt;
-
+    // Store partial sums in shared memory
+    s_ax[tid] = ax;
+    s_ay[tid] = ay;
+    s_az[tid] = az;
     __syncthreads();
     
-    // Collision detection (thread 0 only)
-    if (i == 0) {
-        int aid = d_params.asteroid_id;
-        double dx = s_planet_pos[0] - qx_in[aid];
-        double dy = s_planet_pos[1] - qy_in[aid];
-        double dz = s_planet_pos[2] - qz_in[aid];
-        double dist = sqrt(dx*dx + dy*dy + dz*dz);
-        atomicMinDouble(d_min_dist, dist);
-        if (dist < d_params.planet_radius) {
-            atomicCAS(d_hit_step, -2, step);
+    // Parallel reduction to sum all forces
+    for (int stride = BLOCK_SIZE / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            s_ax[tid] += s_ax[tid + stride];
+            s_ay[tid] += s_ay[tid + stride];
+            s_az[tid] += s_az[tid + stride];
         }
+        __syncthreads();
     }
-
-    // Missile interception check
-    if (!is_p1 && d_device_destroy_steps && my_type == TYPE_DEVICE) {
-        if (d_device_destroy_steps[i] == -1) {
-            double dx = qx_in[i] - s_planet_pos[0];
-            double dy = qy_in[i] - s_planet_pos[1];
-            double dz = qz_in[i] - s_planet_pos[2];
-            double m_dist = (double)step * dt * d_params.missile_speed;
-            if (m_dist * m_dist > (dx*dx + dy*dy + dz*dz)) {
-                d_device_destroy_steps[i] = step;
+    
+    // Thread 0 updates velocity and position
+    if (tid == 0) {
+        double dt = d_params.dt;
+        double new_vx = my_vx + s_ax[0] * dt;
+        double new_vy = my_vy + s_ay[0] * dt;
+        double new_vz = my_vz + s_az[0] * dt;
+        
+        vx_out[body_id] = new_vx;
+        vy_out[body_id] = new_vy;
+        vz_out[body_id] = new_vz;
+        qx_out[body_id] = my_qx + new_vx * dt;
+        qy_out[body_id] = my_qy + new_vy * dt;
+        qz_out[body_id] = my_qz + new_vz * dt;
+        
+        // Collision detection
+        if (body_id == 0) {
+            int aid = d_params.asteroid_id;
+            double dx = s_planet_pos[0] - qx_in[aid];
+            double dy = s_planet_pos[1] - qy_in[aid];
+            double dz = s_planet_pos[2] - qz_in[aid];
+            double dist = sqrt(dx*dx + dy*dy + dz*dz);
+            atomicMinDouble(d_min_dist, dist);
+            if (dist < d_params.planet_radius) {
+                atomicCAS(d_hit_step, -2, step);
+            }
+        }
+        
+        // Missile interception check
+        if (!is_p1 && d_device_destroy_steps && my_type == TYPE_DEVICE) {
+            if (d_device_destroy_steps[body_id] == -1) {
+                double dx = qx_in[body_id] - s_planet_pos[0];
+                double dy = qy_in[body_id] - s_planet_pos[1];
+                double dz = qz_in[body_id] - s_planet_pos[2];
+                double m_dist = (double)step * dt * d_params.missile_speed;
+                if (m_dist * m_dist > (dx*dx + dy*dy + dz*dz)) {
+                    d_device_destroy_steps[body_id] = step;
+                }
             }
         }
     }
@@ -451,7 +441,7 @@ public:
             copy_state(0, 0); 
         }
 
-        // HYBRID DISPATCH
+        // THREE-WAY HYBRID DISPATCH
         if (n <= HYBRID_THRESHOLD) {
             // Small N: single-block kernel runs multiple steps
             for (int s = 0; s < params.n_steps; s += CKPT_INTERVAL) {
@@ -475,10 +465,9 @@ public:
                 std::swap(in, out);
             }
         } else {
-            // Large N: multi-block kernel, one launch per step
-            int blocks = (n + BLOCK_SIZE - 1) / BLOCK_SIZE;
+            // Large N: 1 block per body (best for N > 256)
             for (int s = 1; s <= params.n_steps; s++) {
-                step_kernel_large_fused<<<blocks, BLOCK_SIZE>>>(
+                step_kernel_one_block_per_body<<<n, BLOCK_SIZE>>>(
                     d_qx[in], d_qy[in], d_qz[in], d_vx[in], d_vy[in], d_vz[in],
                     d_qx[out], d_qy[out], d_qz[out], d_vx[out], d_vy[out], d_vz[out],
                     d_mass, d_type, d_sin_table, s, is_p1, d_min_dist, d_hit_step, d_device_destroy_steps);
